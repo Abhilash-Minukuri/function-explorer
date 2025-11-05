@@ -1,0 +1,4 @@
+﻿streamlit==1.*
+plotly==5.*
+sympy==1.*
+pandas==2.*
