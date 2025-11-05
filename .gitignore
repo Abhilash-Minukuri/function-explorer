@@ -1,16 +1,6 @@
-﻿# Python
-__pycache__/
-*.pyc
-
-# Venv
+﻿__pycache__/
 .venv/
-
-# Streamlit secrets
+*.pyc
 .streamlit/secrets.toml
-
-# Local data exports
 data/
-
-# OS junk
 .DS_Store
-Thumbs.db
