@@ -4,3 +4,4 @@
 .streamlit/secrets.toml
 data/
 .DS_Store
+function_explorer/data/
