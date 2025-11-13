@@ -1,25 +1,31 @@
-# Function Explorer – Quadratic MVP Bootstrap
+# Function Explorer – Quadratic MVP
 
-## Environment
+## Getting Started (Dash)
 
-- Requires Python 3.11
-- A local virtual environment `.venv` in the repository root is expected.
+1. **Python 3.11** is required. Create a virtual environment in the repo root:
+   ```
+   python -m venv .venv
+   ```
+2. Activate it (PowerShell example):
+   ```
+   .\.venv\Scripts\activate
+   ```
+3. Install dependencies:
+   ```
+   pip install -r requirements.txt
+   ```
+4. Run the Dash app:
+   ```
+   python dash_app.py
+   ```
+5. Interaction logs are written to `function_explorer/data/dash_events.jsonl`.
 
-## Run (Local)
+## Legacy (Streamlit)
 
-From VS Code’s integrated terminal:
+The original Streamlit UI is still available but no longer the primary experience.
 
 ```
-streamlit run app.py
+streamlit run streamlit_legacy/app.py
 ```
 
-If needed, first activate the venv and install dependencies:
-
-```
-\.venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-## Notes
-
-- Pushing to GitHub is manual and will be done later; no CI/remote setup is included in this step.
+Expect reduced performance and limited functionality compared with the Dash proof-of-concept.

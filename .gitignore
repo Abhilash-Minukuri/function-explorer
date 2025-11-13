@@ -1,7 +1,8 @@
-﻿__pycache__/
+__pycache__/
 .venv/
 *.pyc
 .streamlit/secrets.toml
+streamlit_legacy/.streamlit/secrets.toml
 data/
 .DS_Store
 function_explorer/data/
