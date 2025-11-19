@@ -40,6 +40,8 @@ _SOURCE_STORE_DEFAULT: Dict[str, Any] = {
     "value": None,
     "t": None,
 }
+_TRACE_HISTORY_CAPACITY = 10
+_TRACE_STORE_DEFAULT: Dict[str, Any] = {"entries": [], "capacity": _TRACE_HISTORY_CAPACITY}
 
 _BASE_DIR = Path(__file__).resolve().parent
 _DATA_DIR = _BASE_DIR / "function_explorer" / "data"
@@ -51,7 +53,7 @@ _APP_MODE = "dash-hybrid"
 _DEFAULT_INTERACTION_PHASE = "change"
 _THROTTLE_STATE: Dict[str, Dict[str, Any]] = {}
 _SESSION_PARAM_CACHE: Dict[str, Dict[str, float]] = {}
-_DEFAULT_OVERLAY_STATE = {"vertex_axis": True, "zeros": True}
+_DEFAULT_OVERLAY_STATE = {"vertex_axis": True, "zeros": True, "trace": True}
 _OVERLAY_STATE: Dict[str, Dict[str, bool]] = {}
 _REFLECTION_MAX_LEN = 1000
 _REFLECTION_SOFT_MIN = 20
@@ -530,6 +532,19 @@ def _build_figure(params: Dict[str, float], xs: List[float], uirevision: str) ->
             ),
         ]
     )
+    for _ in range(_TRACE_HISTORY_CAPACITY):
+        fig.add_trace(
+            go.Scatter(
+                x=[],
+                y=[],
+                mode="lines",
+                name="Trace",
+                line=dict(color="rgba(99,110,250,0.35)", width=1.5),
+                opacity=0.35,
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
     fig.update_layout(
         height=560,
         margin=dict(l=36, r=16, t=32, b=32),
@@ -663,6 +678,16 @@ def _serve_layout() -> html.Div:
                 dcc.Checklist(
                     id="toggle-zeros",
                     options=[{"label": "Zeros (x-intercepts)", "value": "on"}],
+                    value=["on"],
+                    labelStyle={"display": "flex", "alignItems": "center", "gap": "6px"},
+                    inputStyle={"marginRight": "6px"},
+                ),
+                style={"marginTop": "8px"},
+            ),
+            html.Div(
+                dcc.Checklist(
+                    id="toggle-trace",
+                    options=[{"label": "Trace mode", "value": "on"}],
                     value=["on"],
                     labelStyle={"display": "flex", "alignItems": "center", "gap": "6px"},
                     inputStyle={"marginRight": "6px"},
@@ -831,6 +856,26 @@ def _serve_layout() -> html.Div:
                 ],
                 style={"marginTop": "32px"},
             ),
+            html.Div(
+                [
+                    html.H3("Trace History"),
+                    html.Div(
+                        "Trace history will appear here.",
+                        id="trace-history",
+                        style={
+                            "fontFamily": "monospace",
+                            "fontSize": "0.9rem",
+                            "backgroundColor": "#f7f7f7",
+                            "borderRadius": "8px",
+                            "padding": "12px",
+                            "marginTop": "8px",
+                            "minHeight": "100px",
+                            "whiteSpace": "pre-line",
+                        },
+                    ),
+                ],
+                style={"marginTop": "32px"},
+            ),
         ],
         style={"padding": "0 32px 32px"},
     )
@@ -851,16 +896,20 @@ def _serve_layout() -> html.Div:
                 data=_default_consent_data(),
             ),
             dcc.Store(id="store-source", data=_SOURCE_STORE_DEFAULT),
+            dcc.Store(id="store-param-pending", data=None),
             dcc.Store(
                 id="store-a-prev",
                 data={"a_prev": _DEFAULT_PARAMS["a"], "visible_until": None, "last_rule": None},
             ),
+            dcc.Store(id="store-param-commit", data=None),
+            dcc.Store(id="store-trace", data=dict(_TRACE_STORE_DEFAULT)),
             dcc.Store(id="store-reflection-draft", data=_default_reflection_draft()),
             dcc.Store(id="store-reflection-status", data=_default_reflection_status()),
             dcc.Store(id="store-reflection-commit", data=None),
             dcc.Store(id="store-reflection-ack", data=None),
             dcc.Interval(id="interval-verbal-a", interval=500, n_intervals=0, disabled=True),
             dcc.Interval(id="interval-reflect-saved", interval=500, n_intervals=0, disabled=True),
+            dcc.Interval(id="interval-param-commit", interval=200, n_intervals=0, disabled=True),
             html.Div(main_content, style={"padding": "32px"}),
             representations_section,
             _build_consent_modal(),
@@ -1443,6 +1492,298 @@ app.clientside_callback(
 
 app.clientside_callback(
     """
+    (function() {
+        const DEFAULTS = {a: 1.0, b: 0.0, c: 0.0};
+        const PARAMS = ["a", "b", "c"];
+        const DELAY_MS = 220;
+        const toNumber = (value, fallback) => {
+            const num = Number(value);
+            return isFinite(num) ? num : fallback;
+        };
+        if (!window.__paramCommitState) {
+            window.__paramCommitState = {
+                nextSeq: 1,
+                values: {a: DEFAULTS.a, b: DEFAULTS.b, c: DEFAULTS.c},
+            };
+        }
+        const ensurePending = (raw) => {
+            if (!raw || typeof raw !== "object") {
+                return null;
+            }
+            if (!raw.commit || typeof raw.ready_at !== "number") {
+                return null;
+            }
+            return raw;
+        };
+        return function(sourceStore, intervalTicks, sliderA, sliderB, sliderC, pendingRaw) {
+            void intervalTicks;
+            const ctx =
+                (window.dash_clientside && window.dash_clientside.callback_context) || {
+                    triggered: [],
+                };
+            const triggered = ctx.triggered.length ? ctx.triggered[0].prop_id : "";
+            const seqState = window.__paramCommitState;
+            let pending = ensurePending(pendingRaw);
+            const noUpdate = window.dash_clientside.no_update;
+
+            const flushCommit = (commitObj) => {
+                if (!commitObj) {
+                    return [pending || null, pending ? false : true, noUpdate];
+                }
+                const seqValue =
+                    typeof commitObj.seq === "number" ? commitObj.seq : seqState.nextSeq || 1;
+                commitObj.seq = seqValue;
+                if (!seqState.values) {
+                    seqState.values = {a: DEFAULTS.a, b: DEFAULTS.b, c: DEFAULTS.c};
+                }
+                if (commitObj.param) {
+                    seqState.values[commitObj.param] = commitObj.new_value;
+                }
+                seqState.nextSeq = seqValue + 1;
+                return [null, true, commitObj];
+            };
+
+            if (!triggered) {
+                return [pending || null, pending ? false : true, noUpdate];
+            }
+
+            if (triggered === "interval-param-commit.n_intervals") {
+                if (!pending) {
+                    return [null, true, noUpdate];
+                }
+                if (Date.now() < pending.ready_at) {
+                    return [pending, false, noUpdate];
+                }
+                const commitObj = pending.commit;
+                pending = null;
+                return flushCommit(commitObj);
+            }
+
+            if (triggered === "store-source.data") {
+                if (!sourceStore || typeof sourceStore !== "object") {
+                    return [pending || null, pending ? false : true, noUpdate];
+                }
+                const param = sourceStore.param;
+                if (!param || PARAMS.indexOf(param) === -1) {
+                    return [pending || null, pending ? false : true, noUpdate];
+                }
+                const sliderValues = {
+                    a: toNumber(sliderA, seqState.values.a),
+                    b: toNumber(sliderB, seqState.values.b),
+                    c: toNumber(sliderC, seqState.values.c),
+                };
+                const newValue = sliderValues[param];
+                if (!isFinite(newValue)) {
+                    return [pending || null, pending ? false : true, noUpdate];
+                }
+                if (sourceStore.value !== undefined && sourceStore.value !== null) {
+                    const meta = Number(sourceStore.value);
+                    if (isFinite(meta) && Math.abs(meta - newValue) > 1e-6) {
+                        return [pending || null, pending ? false : true, noUpdate];
+                    }
+                }
+                const oldValue = seqState.values[param];
+                if (isFinite(oldValue) && Math.abs(oldValue - newValue) < 1e-9) {
+                    return [pending || null, pending ? false : true, noUpdate];
+                }
+                const commit = {
+                    seq: seqState.nextSeq || 1,
+                    param: param,
+                    old_value: oldValue,
+                    new_value: newValue,
+                    source: sourceStore.source || "slider",
+                    t_client:
+                        typeof sourceStore.t === "number" && isFinite(sourceStore.t)
+                            ? sourceStore.t
+                            : Date.now(),
+                    a: sliderValues.a,
+                    b: sliderValues.b,
+                    c: sliderValues.c,
+                };
+                const delay =
+                    sourceStore.source === "slider" || sourceStore.source === "input_drag"
+                        ? DELAY_MS
+                        : 0;
+                if (delay === 0) {
+                    return flushCommit(commit);
+                }
+                pending = {
+                    commit: commit,
+                    ready_at: Date.now() + DELAY_MS,
+                };
+                return [pending, false, noUpdate];
+            }
+
+            return [pending || null, pending ? false : true, noUpdate];
+        };
+    })()
+    """,
+    [
+        Output("store-param-pending", "data"),
+        Output("interval-param-commit", "disabled"),
+        Output("store-param-commit", "data"),
+    ],
+    [
+        Input("store-source", "data"),
+        Input("interval-param-commit", "n_intervals"),
+    ],
+    [
+        State("slider-a", "value"),
+        State("slider-b", "value"),
+        State("slider-c", "value"),
+        State("store-param-pending", "data"),
+    ],
+    prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    """
+    (function() {
+        const CAPACITY = 10;
+        const DEFAULTS = {a: 1.0, b: 0.0, c: 0.0};
+        const ensureStore = (raw) => {
+            if (!raw || typeof raw !== "object") {
+                return {entries: [], capacity: CAPACITY};
+            }
+            const entries = Array.isArray(raw.entries) ? raw.entries.slice(0, CAPACITY) : [];
+            return {entries, capacity: CAPACITY};
+        };
+        const isToggleOn = (value) => {
+            if (Array.isArray(value)) {
+                return value.indexOf("on") !== -1;
+            }
+            if (value === null || value === undefined) {
+                return false;
+            }
+            return Boolean(value);
+        };
+        const roundOne = (value) => {
+            const num = Number(value);
+            if (!isFinite(num)) {
+                return 0;
+            }
+            const rounded = Math.round(num * 10) / 10;
+            return Object.is(rounded, -0) ? 0 : rounded;
+        };
+        const computeYs = (a, b, c, xs) => {
+            if (!Array.isArray(xs)) {
+                return [];
+            }
+            const size = xs.length;
+            const ys = new Array(size);
+            for (let i = 0; i < size; i += 1) {
+                const x = Number(xs[i]);
+                if (!isFinite(x)) {
+                    ys[i] = null;
+                } else {
+                    ys[i] = a * x * x + b * x + c;
+                }
+            }
+            return ys;
+        };
+        const buildSnapshot = (commit, xs) => {
+            if (!commit || typeof commit !== "object" || !Array.isArray(xs)) {
+                return null;
+            }
+            const a = Number(commit.a);
+            const b = Number(commit.b);
+            const c = Number(commit.c);
+            if (!isFinite(a) || !isFinite(b) || !isFinite(c)) {
+                return null;
+            }
+            return {
+                seq: typeof commit.seq === "number" ? commit.seq : Date.now(),
+                a: roundOne(a),
+                b: roundOne(b),
+                c: roundOne(c),
+                y: computeYs(a, b, c, xs),
+                t_client:
+                    typeof commit.t_client === "number" && isFinite(commit.t_client)
+                        ? commit.t_client
+                        : Date.now(),
+                param: commit.param || "?",
+                old_value: commit.old_value,
+                new_value: commit.new_value,
+                source: commit.source || "slider",
+            };
+        };
+        const buildBaseline = (xs) => {
+            return buildSnapshot(
+                {
+                    seq: 0,
+                    a: DEFAULTS.a,
+                    b: DEFAULTS.b,
+                    c: DEFAULTS.c,
+                    param: "reset",
+                    old_value: null,
+                    new_value: null,
+                    source: "reset",
+                    t_client: Date.now(),
+                },
+                xs
+            );
+        };
+        return function(commitData, toggleValue, resetClicks, consentData, traceRaw, xs) {
+            const ctx =
+                (window.dash_clientside && window.dash_clientside.callback_context) || {
+                    triggered: [],
+                };
+            const triggered = ctx.triggered.length ? ctx.triggered[0].prop_id : "";
+            const store = ensureStore(traceRaw);
+            const consentGranted = Boolean(consentData && consentData.granted);
+            const traceEnabled = consentGranted && isToggleOn(toggleValue);
+            if (!consentGranted || !traceEnabled) {
+                if (store.entries.length) {
+                    return {entries: [], capacity: CAPACITY};
+                }
+                return window.dash_clientside.no_update;
+            }
+            if (triggered.startsWith("toggle-trace.")) {
+                return {entries: [], capacity: CAPACITY};
+            }
+            if (triggered.startsWith("store-consent.")) {
+                return {entries: [], capacity: CAPACITY};
+            }
+            if (triggered.startsWith("btn-reset.")) {
+                const baseline = Array.isArray(xs) ? buildBaseline(xs) : null;
+                if (baseline) {
+                    return {entries: [baseline], capacity: CAPACITY};
+                }
+                return {entries: [], capacity: CAPACITY};
+            }
+            if (triggered.startsWith("store-param-commit.")) {
+                if (!commitData || typeof commitData !== "object" || !Array.isArray(xs)) {
+                    return window.dash_clientside.no_update;
+                }
+                const snapshot = buildSnapshot(commitData, xs);
+                if (!snapshot) {
+                    return window.dash_clientside.no_update;
+                }
+                const entries = [snapshot].concat(store.entries);
+                return {entries: entries.slice(0, CAPACITY), capacity: CAPACITY};
+            }
+            return window.dash_clientside.no_update;
+        };
+    })()
+    """,
+    Output("store-trace", "data"),
+    [
+        Input("store-param-commit", "data"),
+        Input("toggle-trace", "value"),
+        Input("btn-reset", "n_clicks"),
+        Input("store-consent", "data"),
+    ],
+    [
+        State("store-trace", "data"),
+        State("store-x", "data"),
+    ],
+    prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    """
     function(
         aSlider,
         bSlider,
@@ -1453,6 +1794,7 @@ app.clientside_callback(
         toggleVertexValue,
         toggleZerosValue,
         uiStore,
+        traceStore,
         figure,
         xs
     ) {
@@ -1462,6 +1804,7 @@ app.clientside_callback(
         }
 
         const fallback = {a: 1.0, b: 0.0, c: 0.0};
+        const fallbackTraceCapacity = 10;
         const resolveValue = (sliderVal, inputVal, key) => {
             let val = Number(sliderVal);
             if (!isFinite(val)) {
@@ -1661,6 +2004,58 @@ app.clientside_callback(
         newLayout.shapes = axisShape ? [axisShape] : [];
         newFigure.layout = newLayout;
 
+        const overlayCapacity =
+            traceStore &&
+            typeof traceStore.capacity === "number" &&
+            traceStore.capacity > 0 &&
+            traceStore.capacity <= fallbackTraceCapacity
+                ? traceStore.capacity
+                : fallbackTraceCapacity;
+        const overlayEntries =
+            traceStore && Array.isArray(traceStore.entries) ? traceStore.entries : [];
+        const overlayStart = 3;
+        const ensureOverlayTrace = () => ({
+            x: [],
+            y: [],
+            mode: "lines",
+            name: "Trace",
+            line: {width: 1.5, color: "rgba(99,110,250,0.35)"},
+            hoverinfo: "skip",
+            showlegend: false,
+        });
+        for (var idx = 0; idx < overlayCapacity; idx++) {
+            const traceIndex = overlayStart + idx;
+            var overlayTrace = newData[traceIndex];
+            if (overlayTrace) {
+                overlayTrace = Object.assign({}, overlayTrace);
+            } else {
+                overlayTrace = ensureOverlayTrace();
+            }
+            const snapshot = overlayEntries[idx];
+            if (
+                snapshot &&
+                Array.isArray(snapshot.y) &&
+                Array.isArray(xs) &&
+                snapshot.y.length === xs.length
+            ) {
+                overlayTrace.x = xs;
+                overlayTrace.y = snapshot.y;
+                const baseOpacity = 0.45;
+                const fadeStep = overlayCapacity > 1 ? 0.35 / (overlayCapacity - 1) : 0.35;
+                const opacity = Math.max(0.08, baseOpacity - idx * fadeStep);
+                overlayTrace.line = Object.assign({}, overlayTrace.line || {}, {
+                    color: "rgba(99,110,250," + opacity.toFixed(3) + ")",
+                    width: 1.6,
+                });
+                overlayTrace.hoverinfo = "skip";
+                overlayTrace.showlegend = false;
+            } else {
+                overlayTrace.x = [];
+                overlayTrace.y = [];
+            }
+            newData[traceIndex] = overlayTrace;
+        }
+
         if (!zerosToggleActive) {
             zerosNotice = "";
         }
@@ -1683,6 +2078,7 @@ app.clientside_callback(
         Input("toggle-vertex", "value"),
         Input("toggle-zeros", "value"),
         Input("store-ui", "data"),
+        Input("store-trace", "data"),
     ],
     [
         State("graph-main", "figure"),
@@ -1943,6 +2339,104 @@ app.clientside_callback(
         Input("slider-b", "value"),
         Input("slider-c", "value"),
         Input("store-source", "data"),
+    ],
+)
+
+
+app.clientside_callback(
+    """
+    (function() {
+        const formatNumber = (value) => {
+            const num = Number(value);
+            if (!isFinite(num)) {
+                return "?";
+            }
+            const rounded = Math.round(num * 10) / 10;
+            const normalized = Object.is(rounded, -0) ? 0 : rounded;
+            const text = normalized.toFixed(1);
+            return text.endsWith(".0") ? text.slice(0, -2) : text;
+        };
+        const isToggleOn = (value) => {
+            if (Array.isArray(value)) {
+                return value.indexOf("on") !== -1;
+            }
+            if (value === null || value === undefined) {
+                return false;
+            }
+            return Boolean(value);
+        };
+        const ensureOrigin = (entry) => {
+            if (!window.__traceHistoryOrigin) {
+                window.__traceHistoryOrigin =
+                    entry && typeof entry.t_client === "number" ? entry.t_client : Date.now();
+            }
+            return window.__traceHistoryOrigin;
+        };
+        const formatTime = (entry) => {
+            const origin = ensureOrigin(entry);
+            const tVal =
+                entry && typeof entry.t_client === "number" ? entry.t_client : Date.now();
+            const delta = tVal - origin;
+            const sign = delta >= 0 ? "+" : "-";
+            const seconds = Math.abs(delta) / 1000;
+            return sign + seconds.toFixed(1) + "s";
+        };
+        const formatChange = (entry) => {
+            if (!entry || entry.param === "reset") {
+                return "baseline (reset)";
+            }
+            const param = entry.param || "?";
+            const oldValue =
+                entry.old_value === null || entry.old_value === undefined
+                    ? "?"
+                    : formatNumber(entry.old_value);
+            const newValue =
+                entry.new_value === null || entry.new_value === undefined
+                    ? "?"
+                    : formatNumber(entry.new_value);
+            const source = entry.source || "slider";
+            return param + " " + oldValue + " → " + newValue + " (" + source + ")";
+        };
+        return function(traceStore, consentData, toggleValue) {
+            const consentGranted = Boolean(consentData && consentData.granted);
+            const traceEnabled = isToggleOn(toggleValue);
+            if (!traceEnabled) {
+                window.__traceHistoryOrigin = null;
+                return "Trace mode is off.";
+            }
+            if (!consentGranted) {
+                window.__traceHistoryOrigin = null;
+                return "Enable research consent to see trace history.";
+            }
+            const entries =
+                traceStore && Array.isArray(traceStore.entries) ? traceStore.entries : [];
+            if (!entries.length) {
+                window.__traceHistoryOrigin = null;
+                return "Trace history will appear here.";
+            }
+            ensureOrigin(entries[0]);
+            const lines = entries.map((entry) => {
+                const timeLabel = formatTime(entry);
+                const changeText = formatChange(entry);
+                const tuple =
+                    "(" +
+                    formatNumber(entry.a) +
+                    ", " +
+                    formatNumber(entry.b) +
+                    ", " +
+                    formatNumber(entry.c) +
+                    ")";
+                return timeLabel + " - " + changeText + " | " + tuple;
+            });
+            return lines.join("\\n");
+        };
+    })()
+    """,
+    Output("trace-history", "children"),
+    [
+        Input("store-trace", "data"),
+        Input("store-consent", "data"),
+        Input("toggle-trace", "value"),
     ],
 )
 
@@ -2351,6 +2845,7 @@ def _log_slider_activity(source_store, a_value, b_value, c_value, session_data, 
     [
         Input("toggle-vertex", "value"),
         Input("toggle-zeros", "value"),
+        Input("toggle-trace", "value"),
     ],
     [
         State("store-session", "data"),
@@ -2360,7 +2855,7 @@ def _log_slider_activity(source_store, a_value, b_value, c_value, session_data, 
     ],
     prevent_initial_call=True,
 )
-def _log_overlay_toggle(vertex_value, zeros_value, session_data, consent_data, ui_store_data, log_store_data):
+def _log_overlay_toggle(vertex_value, zeros_value, trace_value, session_data, consent_data, ui_store_data, log_store_data):
     if not _is_logging_allowed(consent_data):
         return dash.no_update
     session_id = _get_session_id(session_data)
@@ -2376,6 +2871,9 @@ def _log_overlay_toggle(vertex_value, zeros_value, session_data, consent_data, u
     elif trigger_id == "toggle-zeros":
         overlay_key = "zeros"
         new_enabled = _is_toggle_enabled(zeros_value)
+    elif trigger_id == "toggle-trace":
+        overlay_key = "trace"
+        new_enabled = _is_toggle_enabled(trace_value)
     else:
         return dash.no_update
 
