@@ -53,6 +53,27 @@ _THROTTLE_STATE: Dict[str, Dict[str, Any]] = {}
 _SESSION_PARAM_CACHE: Dict[str, Dict[str, float]] = {}
 _DEFAULT_OVERLAY_STATE = {"vertex_axis": True, "zeros": True}
 _OVERLAY_STATE: Dict[str, Dict[str, bool]] = {}
+_REFLECTION_MAX_LEN = 1000
+_REFLECTION_SOFT_MIN = 20
+_REFLECTION_SAVED_MS = 2000
+_DEFAULT_REFLECTION_DRAFT: Dict[str, Any] = {
+    "text": "",
+    "focused_ts": None,
+    "first_meaningful_edit_ts": None,
+    "last_edit_ts": None,
+    "edit_count": 0,
+    "initial_len": 0,
+    "paste_flag": False,
+}
+_DEFAULT_REFLECTION_STATUS: Dict[str, Any] = {
+    "next_seq": 1,
+    "pending_seq": None,
+    "submitting": False,
+    "saved_until": None,
+    "saved_seq": None,
+    "last_ack_seq": None,
+}
+_LAST_REFLECTION_SEQ: Dict[str, int] = {}
 _CSV_BASE_COLUMNS: List[str] = [
     "schema_version",
     "session_id",
@@ -71,6 +92,16 @@ _CSV_BASE_COLUMNS: List[str] = [
     "viewport_yrange_min",
     "viewport_yrange_max",
     "uirevision",
+    "reflection_text",
+    "chars",
+    "words",
+    "draft_total_ms",
+    "idle_to_submit_ms",
+    "edit_count",
+    "char_delta",
+    "paste_flag",
+    "accidental_focus_flag",
+    "t_client",
 ]
 
 _MATHJAX_CDN = "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"
@@ -127,6 +158,14 @@ def _get_session_id(session_data: Optional[Dict[str, Any]]) -> str:
 
 def _default_consent_data() -> Dict[str, Any]:
     return dict(_DEFAULT_CONSENT_STATE)
+
+
+def _default_reflection_draft() -> Dict[str, Any]:
+    return dict(_DEFAULT_REFLECTION_DRAFT)
+
+
+def _default_reflection_status() -> Dict[str, Any]:
+    return dict(_DEFAULT_REFLECTION_STATUS)
 
 
 def _is_logging_allowed(consent_data: Optional[Dict[str, Any]]) -> bool:
@@ -309,6 +348,16 @@ def _flatten_record_for_csv(record: Dict[str, Any]) -> Dict[str, Any]:
     flat["viewport_xrange_max"] = x_max
     flat["viewport_yrange_min"] = y_min
     flat["viewport_yrange_max"] = y_max
+    flat["reflection_text"] = record.get("reflection_text")
+    flat["chars"] = record.get("chars")
+    flat["words"] = record.get("words")
+    flat["draft_total_ms"] = record.get("draft_total_ms")
+    flat["idle_to_submit_ms"] = record.get("idle_to_submit_ms")
+    flat["edit_count"] = record.get("edit_count")
+    flat["char_delta"] = record.get("char_delta")
+    flat["paste_flag"] = record.get("paste_flag")
+    flat["accidental_focus_flag"] = record.get("accidental_focus_flag")
+    flat["t_client"] = record.get("t_client")
     return flat
 
 
@@ -378,6 +427,14 @@ def _format_preview_message(record: Dict[str, Any]) -> str:
     if event == "export":
         export_type = record.get("export_type", "unknown")
         return f"export: {export_type}"
+    if event == "reflection_submit":
+        chars = record.get("chars")
+        try:
+            chars_val = int(chars)
+        except (TypeError, ValueError):
+            chars_val = None
+        char_text = f"{chars_val}" if chars_val is not None else "?"
+        return f"reflection_submit: {char_text} chars"
     return event
 
 
@@ -703,6 +760,77 @@ def _serve_layout() -> html.Div:
                 ],
                 style={"marginTop": "16px"},
             ),
+            html.Div(
+                [
+                    html.H3("Reflection"),
+                    html.P(
+                        "Capture a quick note about what you observed. "
+                        "We'll rotate the prompt later, but for now focus on changes in a."
+                    ),
+                    dcc.Textarea(
+                        id="reflect-input",
+                        value="",
+                        placeholder="Describe what changed when you increased a.",
+                        rows=4,
+                        maxLength=_REFLECTION_MAX_LEN,
+                        style={
+                            "width": "100%",
+                            "minHeight": "120px",
+                            "padding": "10px",
+                            "fontSize": "1rem",
+                            "borderRadius": "8px",
+                            "border": "1px solid #cccccc",
+                            "resize": "vertical",
+                        },
+                    ),
+                    html.Div(
+                        [
+                            html.Span("0 / 1000 characters", id="reflect-char-count"),
+                            html.Span(
+                                "Write at least 20 characters to build a useful log.",
+                                id="reflect-soft-hint",
+                                style={"color": "#555555"},
+                            ),
+                        ],
+                        style={
+                            "display": "flex",
+                            "justifyContent": "space-between",
+                            "alignItems": "center",
+                            "marginTop": "6px",
+                            "fontSize": "0.9rem",
+                        },
+                    ),
+                    html.Div(
+                        [
+                            html.Button(
+                                "Submit Reflection",
+                                id="reflect-submit",
+                                n_clicks=0,
+                                disabled=True,
+                                style={"padding": "10px 18px", "fontWeight": 600},
+                            ),
+                            html.Span(
+                                "Saved",
+                                id="reflect-saved-indicator",
+                                style={
+                                    "marginLeft": "12px",
+                                    "fontSize": "0.9rem",
+                                    "color": "#2e8b57",
+                                    "opacity": 0,
+                                    "transition": "opacity 0.25s ease-in-out",
+                                },
+                            ),
+                        ],
+                        style={"marginTop": "12px", "display": "flex", "alignItems": "center"},
+                    ),
+                    html.Div(
+                        "",
+                        id="reflect-error-message",
+                        style={"color": "#cc3311", "fontSize": "0.9rem", "minHeight": "1.2em"},
+                    ),
+                ],
+                style={"marginTop": "32px"},
+            ),
         ],
         style={"padding": "0 32px 32px"},
     )
@@ -727,10 +855,42 @@ def _serve_layout() -> html.Div:
                 id="store-a-prev",
                 data={"a_prev": _DEFAULT_PARAMS["a"], "visible_until": None, "last_rule": None},
             ),
+            dcc.Store(id="store-reflection-draft", data=_default_reflection_draft()),
+            dcc.Store(id="store-reflection-status", data=_default_reflection_status()),
+            dcc.Store(id="store-reflection-commit", data=None),
+            dcc.Store(id="store-reflection-ack", data=None),
             dcc.Interval(id="interval-verbal-a", interval=500, n_intervals=0, disabled=True),
+            dcc.Interval(id="interval-reflect-saved", interval=500, n_intervals=0, disabled=True),
             html.Div(main_content, style={"padding": "32px"}),
             representations_section,
             _build_consent_modal(),
+            html.Script(
+                """
+                (function() {
+                    if (window.__reflectShortcutAttached) {
+                        return;
+                    }
+                    window.__reflectShortcutAttached = true;
+                    document.addEventListener("keydown", function(event) {
+                        if (!(event.metaKey || event.ctrlKey) || event.key !== "Enter") {
+                            return;
+                        }
+                        const active = document.activeElement;
+                        const textarea = document.getElementById("reflect-input");
+                        if (!textarea || active !== textarea) {
+                            return;
+                        }
+                        const button = document.getElementById("reflect-submit");
+                        if (!button || button.disabled) {
+                            return;
+                        }
+                        event.preventDefault();
+                        button.click();
+                    });
+                })();
+                """,
+                id="reflect-shortcut-script",
+            ),
         ]
     )
 
@@ -922,6 +1082,191 @@ app.clientside_callback(
         State("input-a", "value"),
         State("input-b", "value"),
         State("input-c", "value"),
+    ],
+    prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    """
+    (function() {
+        const defaultStatus = () => ({
+            next_seq: 1,
+            pending_seq: null,
+            submitting: false,
+            saved_until: null,
+            saved_seq: null,
+            last_ack_seq: null,
+        });
+        return function(ackData, statusRaw) {
+            const ack = ackData && typeof ackData === "object" ? ackData : null;
+            if (!ack || typeof ack.seq !== "number") {
+                return window.dash_clientside.no_update;
+            }
+            const status = statusRaw && typeof statusRaw === "object" ? Object.assign(defaultStatus(), statusRaw) : defaultStatus();
+            const alreadyHandled =
+                typeof status.last_ack_seq === "number" && status.last_ack_seq >= ack.seq;
+            if (alreadyHandled) {
+                return window.dash_clientside.no_update;
+            }
+            const next = Object.assign({}, status, {
+                last_ack_seq: ack.seq,
+                submitting: false,
+            });
+            const shouldClearPending =
+                typeof status.pending_seq === "number" && status.pending_seq === ack.seq;
+            if (shouldClearPending) {
+                next.pending_seq = null;
+            }
+            if (ack.status === "ok") {
+                next.saved_until = Date.now() + %d;
+                next.saved_seq = ack.seq;
+                if (typeof next.next_seq !== "number" || next.next_seq <= ack.seq) {
+                    next.next_seq = ack.seq + 1;
+                }
+            } else {
+                next.saved_until = null;
+                next.saved_seq = null;
+            }
+            return next;
+        };
+    })()
+    """ % _REFLECTION_SAVED_MS,
+    Output("store-reflection-status", "data", allow_duplicate=True),
+    Input("store-reflection-ack", "data"),
+    State("store-reflection-status", "data"),
+    prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    """
+    (function() {
+        const MAX_LEN = %d;
+        const ensureDraft = (raw) => {
+            if (!raw || typeof raw !== "object") {
+                return {
+                    text: "",
+                    focused_ts: null,
+                    first_meaningful_edit_ts: null,
+                    last_edit_ts: null,
+                    edit_count: 0,
+                    initial_len: 0,
+                    paste_flag: false,
+                };
+            }
+            return raw;
+        };
+        const ensureStatus = (raw) => {
+            if (!raw || typeof raw !== "object") {
+                return {
+                    next_seq: 1,
+                    pending_seq: null,
+                    submitting: false,
+                    saved_until: null,
+                    saved_seq: null,
+                    last_ack_seq: null,
+                };
+            }
+            const status = Object.assign(
+                {
+                    next_seq: 1,
+                    pending_seq: null,
+                    submitting: false,
+                    saved_until: null,
+                    saved_seq: null,
+                    last_ack_seq: null,
+                },
+                raw
+            );
+            if (typeof status.next_seq !== "number" || !isFinite(status.next_seq)) {
+                status.next_seq = 1;
+            }
+            return status;
+        };
+        const countWords = (text) => {
+            if (!text) {
+                return 0;
+            }
+            const tokens = text.trim().split(/\\s+/).filter(Boolean);
+            return tokens.length;
+        };
+
+        return function(nClicks, draftRaw, consentData, statusRaw, value) {
+            const ctx = window.dash_clientside && window.dash_clientside.callback_context;
+            if (!ctx || !ctx.triggered || !ctx.triggered.length) {
+                return [window.dash_clientside.no_update, window.dash_clientside.no_update];
+            }
+            const triggered = ctx.triggered[0].prop_id;
+            if (!triggered.startsWith("reflect-submit.")) {
+                return [window.dash_clientside.no_update, window.dash_clientside.no_update];
+            }
+            const consentGranted = Boolean(consentData && consentData.granted);
+            if (!consentGranted) {
+                return [window.dash_clientside.no_update, window.dash_clientside.no_update];
+            }
+            const draft = ensureDraft(draftRaw);
+            const status = ensureStatus(statusRaw);
+            if (status.submitting) {
+                return [window.dash_clientside.no_update, window.dash_clientside.no_update];
+            }
+            const text = typeof value === "string" ? value : "";
+            const trimmed = text.trim();
+            if (!trimmed) {
+                return [window.dash_clientside.no_update, window.dash_clientside.no_update];
+            }
+            if (trimmed.length > MAX_LEN) {
+                return [window.dash_clientside.no_update, window.dash_clientside.no_update];
+            }
+            const now = Date.now();
+            const seq = status.next_seq || 1;
+            const words = countWords(trimmed);
+            const draftStart = typeof draft.first_meaningful_edit_ts === "number" ? draft.first_meaningful_edit_ts : null;
+            const draftTotal = draftStart ? now - draftStart : null;
+            const lastEdit = typeof draft.last_edit_ts === "number" ? draft.last_edit_ts : null;
+            const idleToSubmit = lastEdit ? now - lastEdit : null;
+            const focusedTs = typeof draft.focused_ts === "number" ? draft.focused_ts : null;
+            const accidentalFocus =
+                focusedTs !== null &&
+                draftStart !== null &&
+                draftStart - focusedTs > 2000;
+            const initialLen = typeof draft.initial_len === "number" ? draft.initial_len : 0;
+            const charDelta = trimmed.length - initialLen;
+            const commit = {
+                seq: seq,
+                t_client: now,
+                reflection_text: trimmed,
+                chars: trimmed.length,
+                words: words,
+                draft_total_ms: draftTotal,
+                idle_to_submit_ms: idleToSubmit,
+                edit_count: draft.edit_count || 0,
+                char_delta: charDelta,
+                paste_flag: Boolean(draft.paste_flag),
+                accidental_focus_flag: Boolean(accidentalFocus),
+            };
+            const nextStatus = Object.assign({}, status, {
+                pending_seq: seq,
+                submitting: true,
+                saved_until: null,
+                saved_seq: null,
+                last_ack_seq: status.last_ack_seq || null,
+                next_seq: seq + 1,
+            });
+            return [commit, nextStatus];
+        };
+    })()
+    """ % _REFLECTION_MAX_LEN,
+    [
+        Output("store-reflection-commit", "data"),
+        Output("store-reflection-status", "data", allow_duplicate=True),
+    ],
+    Input("reflect-submit", "n_clicks"),
+    [
+        State("store-reflection-draft", "data"),
+        State("store-consent", "data"),
+        State("store-reflection-status", "data"),
+        State("reflect-input", "value"),
     ],
     prevent_initial_call=True,
 )
@@ -1347,6 +1692,164 @@ app.clientside_callback(
 
 
 app.clientside_callback(
+    """
+    (function() {
+        const MAX_LEN = %d;
+        const SOFT_MIN = %d;
+        const defaultDraft = () => ({
+            text: "",
+            focused_ts: null,
+            first_meaningful_edit_ts: null,
+            last_edit_ts: null,
+            edit_count: 0,
+            initial_len: 0,
+            paste_flag: false,
+        });
+        const ensureDraft = (raw) => {
+            if (!raw || typeof raw !== "object") {
+                return defaultDraft();
+            }
+            const draft = Object.assign(defaultDraft(), raw);
+            draft.text = typeof draft.text === "string" ? draft.text : "";
+            draft.focused_ts =
+                typeof draft.focused_ts === "number" && isFinite(draft.focused_ts)
+                    ? draft.focused_ts
+                    : null;
+            draft.first_meaningful_edit_ts =
+                typeof draft.first_meaningful_edit_ts === "number" && isFinite(draft.first_meaningful_edit_ts)
+                    ? draft.first_meaningful_edit_ts
+                    : null;
+            draft.last_edit_ts =
+                typeof draft.last_edit_ts === "number" && isFinite(draft.last_edit_ts)
+                    ? draft.last_edit_ts
+                    : null;
+            draft.edit_count = typeof draft.edit_count === "number" ? draft.edit_count : 0;
+            draft.initial_len = typeof draft.initial_len === "number" ? draft.initial_len : 0;
+            draft.paste_flag = Boolean(draft.paste_flag);
+            return draft;
+        };
+
+        return function(
+            value,
+            clickTs,
+            ackData,
+            consentData,
+            statusData,
+            draftState
+        ) {
+            const ctx = window.dash_clientside && window.dash_clientside.callback_context;
+            const triggered = ctx && ctx.triggered && ctx.triggered.length ? ctx.triggered[0].prop_id : "";
+            let draft = ensureDraft(draftState);
+            let nextValue = typeof value === "string" ? value : "";
+            const consentGranted = Boolean(consentData && consentData.granted);
+            const status = statusData && typeof statusData === "object" ? statusData : {};
+            const pendingSeq = status.pending_seq;
+            const submitting = Boolean(status.submitting);
+            const ack =
+                ackData && typeof ackData === "object" && ackData !== null ? ackData : null;
+            const ackSeq = ack && typeof ack.seq === "number" ? ack.seq : null;
+            const shouldReset =
+                triggered === "store-reflection-ack.data" &&
+                ack &&
+                ack.status === "ok" &&
+                ackSeq !== null &&
+                pendingSeq !== null &&
+                ackSeq === pendingSeq;
+
+            if (shouldReset) {
+                draft = defaultDraft();
+                nextValue = "";
+            } else {
+                if (triggered === "reflect-input.n_clicks_timestamp" && !draft.focused_ts) {
+                    if (typeof clickTs === "number" && isFinite(clickTs) && clickTs > 0) {
+                        draft.focused_ts = clickTs;
+                    } else {
+                        draft.focused_ts = Date.now();
+                    }
+                }
+                if (nextValue.length > MAX_LEN) {
+                    nextValue = nextValue.slice(0, MAX_LEN);
+                }
+                const prevText = draft.text || "";
+                if (nextValue !== prevText) {
+                    const now = Date.now();
+                    const prevLen = prevText.length;
+                    const newLen = nextValue.length;
+                    const delta = Math.abs(newLen - prevLen);
+                    draft.text = nextValue;
+                    draft.last_edit_ts = now;
+                    draft.edit_count = (draft.edit_count || 0) + 1;
+                    if (delta >= 20) {
+                        draft.paste_flag = true;
+                    }
+                    const trimmedLen = nextValue.trim().length;
+                    if (!draft.first_meaningful_edit_ts) {
+                        if (trimmedLen >= 10 || delta >= 3) {
+                            draft.first_meaningful_edit_ts = now;
+                        }
+                    }
+                    if (trimmedLen > 0 && (!draft.initial_len || draft.initial_len < 0)) {
+                        draft.initial_len = prevLen;
+                    } else if (trimmedLen > 0 && draft.initial_len === 0 && prevLen === 0) {
+                        draft.initial_len = 0;
+                    }
+                    if (!draft.focused_ts) {
+                        draft.focused_ts = now;
+                    }
+                }
+            }
+
+            const text = draft.text || "";
+            const trimmed = text.trim();
+            const length = text.length;
+            let counterText = `${length} / ${MAX_LEN} characters`;
+            if (length >= MAX_LEN) {
+                counterText += " (max)";
+            }
+            let hint = "";
+            if (!trimmed.length) {
+                hint = "Write at least 20 characters to build a useful log.";
+            } else if (trimmed.length < SOFT_MIN) {
+                const remaining = SOFT_MIN - trimmed.length;
+                hint = `Add ${remaining} more character${remaining === 1 ? "" : "s"} for a stronger reflection.`;
+            } else {
+                hint = "Great! Ready to submit.";
+            }
+
+            let disabled = !consentGranted || trimmed.length === 0 || length > MAX_LEN || submitting;
+            let errorText = "";
+            if (!consentGranted) {
+                errorText = "Please accept consent to enable reflections.";
+            } else if (length > MAX_LEN) {
+                errorText = "Reflection is too long.";
+            } else if (submitting) {
+                errorText = "Submitting…";
+            }
+
+            return [draft, nextValue, counterText, hint, disabled, errorText];
+        };
+    })()
+    """ % (_REFLECTION_MAX_LEN, _REFLECTION_SOFT_MIN),
+    [
+        Output("store-reflection-draft", "data"),
+        Output("reflect-input", "value"),
+        Output("reflect-char-count", "children"),
+        Output("reflect-soft-hint", "children"),
+        Output("reflect-submit", "disabled"),
+        Output("reflect-error-message", "children"),
+    ],
+    [
+        Input("reflect-input", "value"),
+        Input("reflect-input", "n_clicks_timestamp"),
+        Input("store-reflection-ack", "data"),
+        Input("store-consent", "data"),
+        Input("store-reflection-status", "data"),
+    ],
+    State("store-reflection-draft", "data"),
+    prevent_initial_call=True,
+)
+
+app.clientside_callback(
     r"""
     (function() {
         const toOneDecimal = (value) => {
@@ -1647,6 +2150,138 @@ app.clientside_callback(
     ],
     State("store-a-prev", "data"),
 )
+
+
+app.clientside_callback(
+    """
+    (function() {
+        const baseStyle = {
+            marginLeft: "12px",
+            fontSize: "0.9rem",
+            color: "#2e8b57",
+            opacity: 0,
+            transition: "opacity 0.25s ease-in-out",
+        };
+        const ensureStatus = (raw) => {
+            if (!raw || typeof raw !== "object") {
+                return {};
+            }
+            return raw;
+        };
+        return function(statusData, intervalTicks) {
+            void intervalTicks;
+            const status = ensureStatus(statusData);
+            const until =
+                status && typeof status.saved_until === "number" && isFinite(status.saved_until)
+                    ? status.saved_until
+                    : null;
+            const now = Date.now();
+            const visible = until !== null && now < until;
+            const indicatorStyle = Object.assign({}, baseStyle, {
+                opacity: visible ? 1 : 0,
+            });
+            const disableInterval = visible ? false : true;
+            return [indicatorStyle, disableInterval];
+        };
+    })()
+    """,
+    [
+        Output("reflect-saved-indicator", "style"),
+        Output("interval-reflect-saved", "disabled"),
+    ],
+    [
+        Input("store-reflection-status", "data"),
+        Input("interval-reflect-saved", "n_intervals"),
+    ],
+)
+
+
+@app.callback(
+    [
+        Output("store-reflection-ack", "data"),
+        Output("store-log-sink", "data", allow_duplicate=True),
+    ],
+    Input("store-reflection-commit", "data"),
+    [
+        State("store-session", "data"),
+        State("store-consent", "data"),
+        State("store-ui", "data"),
+        State("store-log-sink", "data"),
+    ],
+    prevent_initial_call=True,
+)
+def _log_reflection_submit(commit_data, session_data, consent_data, ui_store_data, log_store_data):
+    if not isinstance(commit_data, dict):
+        return dash.no_update, dash.no_update
+    seq = commit_data.get("seq")
+    try:
+        seq_int = int(seq)
+    except (TypeError, ValueError):
+        return dash.no_update, dash.no_update
+
+    session_id = _get_session_id(session_data)
+    safe_id = _safe_session_id(session_id)
+    ack_payload: Dict[str, Any] = {"seq": seq_int, "status": "noop"}
+    if not _is_logging_allowed(consent_data):
+        ack_payload["status"] = "blocked_no_consent"
+        return ack_payload, dash.no_update
+
+    last_seq = _LAST_REFLECTION_SEQ.get(safe_id, 0)
+    if seq_int <= last_seq:
+        ack_payload["status"] = "duplicate"
+        return ack_payload, dash.no_update
+
+    reflection_text = (commit_data.get("reflection_text") or "").strip()
+    if not reflection_text:
+        ack_payload["status"] = "empty"
+        return ack_payload, dash.no_update
+
+    chars = commit_data.get("chars")
+    try:
+        chars_int = int(chars)
+    except (TypeError, ValueError):
+        chars_int = len(reflection_text)
+    words = commit_data.get("words")
+    try:
+        words_int = int(words)
+    except (TypeError, ValueError):
+        words_int = len(reflection_text.split())
+
+    def _int_or_none(value: Any) -> Optional[int]:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed
+
+    extras = {
+        "reflection_text": reflection_text,
+        "chars": chars_int,
+        "words": words_int,
+        "draft_total_ms": _int_or_none(commit_data.get("draft_total_ms")),
+        "idle_to_submit_ms": _int_or_none(commit_data.get("idle_to_submit_ms")),
+        "edit_count": _int_or_none(commit_data.get("edit_count")),
+        "char_delta": _int_or_none(commit_data.get("char_delta")),
+        "paste_flag": bool(commit_data.get("paste_flag")),
+        "accidental_focus_flag": bool(commit_data.get("accidental_focus_flag")),
+        "t_client": _int_or_none(commit_data.get("t_client")),
+    }
+    record = _base_log_record(
+        session_id,
+        event="reflection_submit",
+        param_name=None,
+        old_value=None,
+        new_value=None,
+        source="input",
+        uirevision=_resolve_uirevision_value(ui_store_data),
+        viewport=None,
+        extras=extras,
+    )
+    _write_log_record(session_id, record)
+    _LAST_REFLECTION_SEQ[safe_id] = seq_int
+    ack_payload["status"] = "ok"
+    summary = _format_preview_message(record)
+    return ack_payload, _append_preview_log(log_store_data, summary)
 
 
 @app.callback(
