@@ -1028,8 +1028,15 @@ app.clientside_callback(
             return Number(scaled.toFixed(6));
         };
 
-        if (!window.__paramSyncState) {
-            window.__paramSyncState = {slider: {a: null, b: null, c: null}};
+        if (!window.__paramSyncState || !window.__paramSyncState.slider) {
+            window.__paramSyncState = {slider: {a: DEFAULTS.a, b: DEFAULTS.b, c: DEFAULTS.c}};
+        } else {
+            const sliderState = window.__paramSyncState.slider;
+            ["a", "b", "c"].forEach((key) => {
+                if (typeof sliderState[key] !== "number" || !isFinite(sliderState[key])) {
+                    sliderState[key] = DEFAULTS[key];
+                }
+            });
         }
 
         return function(aSlider, bSlider, cSlider, sourceStore) {
@@ -1644,21 +1651,19 @@ app.clientside_callback(
 
 @app.callback(
     Output("store-log-sink", "data", allow_duplicate=True),
+    Input("store-source", "data"),
     [
-        Input("slider-a", "value"),
-        Input("slider-b", "value"),
-        Input("slider-c", "value"),
-    ],
-    [
+        State("slider-a", "value"),
+        State("slider-b", "value"),
+        State("slider-c", "value"),
         State("store-session", "data"),
         State("store-consent", "data"),
-        State("store-source", "data"),
         State("store-ui", "data"),
         State("store-log-sink", "data"),
     ],
     prevent_initial_call=True,
 )
-def _log_slider_activity(a_value, b_value, c_value, session_data, consent_data, source_store, ui_store_data, log_store_data):
+def _log_slider_activity(source_store, a_value, b_value, c_value, session_data, consent_data, ui_store_data, log_store_data):
     a_num = _coerce_float(a_value)
     b_num = _coerce_float(b_value)
     c_num = _coerce_float(c_value)
