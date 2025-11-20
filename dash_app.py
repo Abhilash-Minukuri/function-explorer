@@ -1676,7 +1676,7 @@ app.clientside_callback(
             return isFinite(num) ? num : fallback;
         };
 
-        return function(aInput, bInput, cInput, sliderA, sliderB, sliderC) {
+        return function(aInput, bInput, cInput, sliderA, sliderB, sliderC, sourceStore) {
             const sliderValues = {
                 a: toNumber(sliderA, DEFAULTS.a),
                 b: toNumber(sliderB, DEFAULTS.b),
@@ -1710,9 +1710,29 @@ app.clientside_callback(
 
             let storeUpdate = window.dash_clientside.no_update;
             if (changedParam !== null) {
+                const recentSliderUpdate =
+                    sourceStore &&
+                    sourceStore.source === "slider" &&
+                    sourceStore.param === changedParam;
+                const recentSliderVal = Number(
+                    sourceStore && sourceStore.value
+                );
+                const matchesRecentSlider =
+                    recentSliderUpdate &&
+                    isFinite(recentSliderVal) &&
+                    isFinite(sliderValues[changedParam]) &&
+                    Math.abs(recentSliderVal - sliderValues[changedParam]) < 1e-6;
+                const recentSliderAge =
+                    recentSliderUpdate && typeof sourceStore.t === "number"
+                        ? Date.now() - sourceStore.t
+                        : Infinity;
+                const isLikelySliderEcho =
+                    matchesRecentSlider && recentSliderAge < 500;
+
+                const resolvedSource = isLikelySliderEcho ? "slider" : "input";
                 storeUpdate = {
                     param: changedParam,
-                    source: "input",
+                    source: resolvedSource,
                     value: sliderValues[changedParam],
                     t: Date.now(),
                 };
@@ -1737,6 +1757,7 @@ app.clientside_callback(
         State("slider-a", "value"),
         State("slider-b", "value"),
         State("slider-c", "value"),
+        State("store-source", "data"),
     ],
     prevent_initial_call=True,
 )
