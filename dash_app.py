@@ -76,6 +76,7 @@ _DEFAULT_REFLECTION_STATUS: Dict[str, Any] = {
     "last_ack_seq": None,
 }
 _LAST_REFLECTION_SEQ: Dict[str, int] = {}
+_DEFAULT_ABOUT_STATE: Dict[str, Any] = {"seen": False, "open": True}
 _CSV_BASE_COLUMNS: List[str] = [
     "schema_version",
     "session_id",
@@ -168,6 +169,10 @@ def _default_reflection_draft() -> Dict[str, Any]:
 
 def _default_reflection_status() -> Dict[str, Any]:
     return dict(_DEFAULT_REFLECTION_STATUS)
+
+
+def _default_about_state() -> Dict[str, Any]:
+    return dict(_DEFAULT_ABOUT_STATE)
 
 
 def _is_logging_allowed(consent_data: Optional[Dict[str, Any]]) -> bool:
@@ -511,13 +516,14 @@ def _build_figure(params: Dict[str, float], xs: List[float], uirevision: str) ->
                 y=ys,
                 mode="lines",
                 name="y = ax^2 + bx + c",
+                line=dict(color="#0072B2", width=3),
             ),
             go.Scatter(
                 x=[],
                 y=[],
                 mode="markers",
                 name="Vertex",
-                marker=dict(color="#EF553B", size=10, line=dict(color="#ffffff", width=1)),
+                marker=dict(color="#D55E00", size=10, symbol="circle", line=dict(color="#ffffff", width=1)),
                 hovertemplate="Vertex<br>x=%{x:.2f}<br>y=%{y:.2f}<extra></extra>",
                 showlegend=False,
             ),
@@ -526,7 +532,7 @@ def _build_figure(params: Dict[str, float], xs: List[float], uirevision: str) ->
                 y=[],
                 mode="markers",
                 name="Zeros",
-                marker=dict(color="#00b5ad", size=9, symbol="x", line=dict(color="#ffffff", width=1)),
+                marker=dict(color="#000000", size=9, symbol="x", line=dict(color="#ffffff", width=1)),
                 hovertemplate="Zero<br>x=%{x:.2f}<extra></extra>",
                 showlegend=False,
             ),
@@ -539,7 +545,7 @@ def _build_figure(params: Dict[str, float], xs: List[float], uirevision: str) ->
                 y=[],
                 mode="lines",
                 name="Trace",
-                line=dict(color="rgba(99,110,250,0.35)", width=1.5),
+                line=dict(color="rgba(0,114,178,0.35)", width=1.5),
                 opacity=0.35,
                 hoverinfo="skip",
                 showlegend=False,
@@ -552,13 +558,13 @@ def _build_figure(params: Dict[str, float], xs: List[float], uirevision: str) ->
             title="x",
             showgrid=True,
             zeroline=True,
-            zerolinecolor="#999999",
+            zerolinecolor="#777777",
         ),
         yaxis=dict(
             title="y",
             showgrid=True,
             zeroline=True,
-            zerolinecolor="#999999",
+            zerolinecolor="#777777",
         ),
         showlegend=False,
         uirevision=uirevision,
@@ -584,6 +590,37 @@ def _param_control_row(param: str, label: str, *, marks: Dict[float, str]) -> ht
     input_id = f"input-{param}"
     minus_id = f"btn-{param}-minus"
     plus_id = f"btn-{param}-plus"
+    desc_id = f"desc-{param}"
+    slider_labels = {
+        "a": "Coefficient a (quadratic term)",
+        "b": "Coefficient b (linear term)",
+        "c": "Coefficient c (constant term)",
+    }
+    input_labels = {
+        "a": "Coefficient a (exact value)",
+        "b": "Coefficient b (exact value)",
+        "c": "Coefficient c (exact value)",
+    }
+    slider_titles = {
+        "a": "Drag to change a (opening & width). Larger |a| narrows; a < 0 flips downward.",
+        "b": "Drag to change b (horizontal shift). Vertex x = -b/(2a).",
+        "c": "Drag to change c (vertical shift up/down).",
+    }
+    input_titles = {
+        "a": "Type an exact a value (-5.0 to 5.0, step 0.1).",
+        "b": "Type an exact b value (-10.0 to 10.0, step 0.1).",
+        "c": "Type an exact c value (-10.0 to 10.0, step 0.1).",
+    }
+    minus_titles = {
+        "a": "Decrease a by 0.1.",
+        "b": "Decrease b by 0.1.",
+        "c": "Decrease c by 0.1.",
+    }
+    plus_titles = {
+        "a": "Increase a by 0.1.",
+        "b": "Increase b by 0.1.",
+        "c": "Increase c by 0.1.",
+    }
     return html.Div(
         [
             html.Label(label, htmlFor=slider_id, style={"fontWeight": 600}),
@@ -601,35 +638,55 @@ def _param_control_row(param: str, label: str, *, marks: Dict[float, str]) -> ht
                             tooltip={"placement": "bottom", "always_visible": False},
                         ),
                         style={"flex": "1"},
+                        title=slider_titles[param],
                     ),
-                    dcc.Input(
-                        id=input_id,
-                        type="number",
-                        min=cfg["min"],
-                        max=cfg["max"],
-                        step=cfg["step"],
-                        value=_DEFAULT_PARAMS[param],
-                        style={
-                            "width": "90px",
-                            "marginLeft": "12px",
-                            "marginRight": "8px",
+                    html.Div(
+                        dcc.Input(
+                            id=input_id,
+                            type="number",
+                            min=cfg["min"],
+                            max=cfg["max"],
+                            step=cfg["step"],
+                            value=_DEFAULT_PARAMS[param],
+                            className="numeric-input",
+                            placeholder=input_titles[param],
+                            style={
+                                "width": "96px",
+                                "marginLeft": "12px",
+                                "marginRight": "8px",
+                                "height": "44px",
+                            },
+                        ),
+                        role="group",
+                        title=input_titles[param],
+                        **{
+                            "aria-label": input_labels[param],
+                            "aria-describedby": desc_id,
                         },
                     ),
                     html.Button(
                         "-",
                         id=minus_id,
                         n_clicks=0,
+                        className="a11y-target",
+                        type="button",
                         style={
                             "width": "44px",
                             "height": "44px",
                             "marginRight": "4px",
                         },
+                        title=minus_titles[param],
+                        **{"aria-label": f"Decrease {param}"},
                     ),
                     html.Button(
                         "+",
                         id=plus_id,
                         n_clicks=0,
+                        className="a11y-target",
+                        type="button",
                         style={"width": "44px", "height": "44px"},
+                        title=plus_titles[param],
+                        **{"aria-label": f"Increase {param}"},
                     ),
                 ],
                 style={
@@ -644,6 +701,88 @@ def _param_control_row(param: str, label: str, *, marks: Dict[float, str]) -> ht
 
 
 def _serve_layout() -> html.Div:
+    global_styles = dcc.Markdown(
+        """
+<style>
+.visually-hidden {
+    position: absolute !important;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+.rc-slider-handle:focus-visible,
+.dash-core-components input:focus-visible {
+    outline: 3px solid #ffbf47;
+    outline-offset: 2px;
+}
+.a11y-target {
+    min-width: 44px;
+    min-height: 44px;
+}
+.numeric-input {
+    text-align: right;
+}
+.about-info-button {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    border: 1px solid #004a7c;
+    background-color: #0072b2;
+    color: #ffffff;
+    font-weight: 600;
+    font-size: 1.1rem;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    z-index: 1300;
+}
+.about-info-button:hover {
+    background-color: #005b8a;
+}
+</style>
+        """,
+        dangerously_allow_html=True,
+    )
+
+    descriptions = html.Div(
+        [
+            html.Span(
+                "Controls width and opening; larger |a| narrows; a < 0 opens downward.",
+                id="desc-a",
+            ),
+            html.Span(
+                "Moves the vertex left/right; vertex x = -b/(2a) when a != 0.",
+                id="desc-b",
+            ),
+            html.Span(
+                "Shifts the graph up/down; y-intercept at (0, c).",
+                id="desc-c",
+            ),
+        ],
+        className="visually-hidden",
+        style={
+            "position": "absolute",
+            "width": "1px",
+            "height": "1px",
+            "padding": "0",
+            "margin": "-1px",
+            "overflow": "hidden",
+            "clip": "rect(0, 0, 0, 0)",
+            "whiteSpace": "nowrap",
+            "border": "0",
+        },
+        **{"aria-hidden": "true"},
+    )
+
     controls_column = html.Div(
         [
             html.H2("Controls"),
@@ -662,14 +801,21 @@ def _serve_layout() -> html.Div:
                 "Reset view & params",
                 id="btn-reset",
                 n_clicks=0,
+                className="a11y-target",
                 style={"marginTop": "8px"},
+                title="Reset parameters and reset view",
+                **{"aria-label": "Reset parameters and reset view"},
             ),
             html.Div(
                 dcc.Checklist(
                     id="toggle-vertex",
                     options=[{"label": "Vertex & axis", "value": "on"}],
                     value=["on"],
-                    labelStyle={"display": "flex", "alignItems": "center", "gap": "6px"},
+                    labelStyle={
+                        "display": "flex",
+                        "alignItems": "center",
+                        "gap": "6px",
+                    },
                     inputStyle={"marginRight": "6px"},
                 ),
                 style={"marginTop": "16px"},
@@ -679,7 +825,11 @@ def _serve_layout() -> html.Div:
                     id="toggle-zeros",
                     options=[{"label": "Zeros (x-intercepts)", "value": "on"}],
                     value=["on"],
-                    labelStyle={"display": "flex", "alignItems": "center", "gap": "6px"},
+                    labelStyle={
+                        "display": "flex",
+                        "alignItems": "center",
+                        "gap": "6px",
+                    },
                     inputStyle={"marginRight": "6px"},
                 ),
                 style={"marginTop": "8px"},
@@ -689,7 +839,11 @@ def _serve_layout() -> html.Div:
                     id="toggle-trace",
                     options=[{"label": "Trace mode", "value": "on"}],
                     value=["on"],
-                    labelStyle={"display": "flex", "alignItems": "center", "gap": "6px"},
+                    labelStyle={
+                        "display": "flex",
+                        "alignItems": "center",
+                        "gap": "6px",
+                    },
                     inputStyle={"marginRight": "6px"},
                 ),
                 style={"marginTop": "8px"},
@@ -752,6 +906,8 @@ def _serve_layout() -> html.Div:
                     html.Div(
                         "",
                         id="verbal-a-tip",
+                        role="status",
+                        **{"aria-live": "polite"},
                         style={
                             "fontSize": "0.9rem",
                             "color": "#444444",
@@ -765,6 +921,8 @@ def _serve_layout() -> html.Div:
                     html.Div(
                         "",
                         id="vertex-notice",
+                        role="status",
+                        **{"aria-live": "polite"},
                         style={
                             "fontSize": "0.9rem",
                             "color": "#555555",
@@ -775,6 +933,8 @@ def _serve_layout() -> html.Div:
                     html.Div(
                         "",
                         id="zeros-notice",
+                        role="status",
+                        **{"aria-live": "polite"},
                         style={
                             "fontSize": "0.9rem",
                             "color": "#555555",
@@ -832,7 +992,10 @@ def _serve_layout() -> html.Div:
                                 id="reflect-submit",
                                 n_clicks=0,
                                 disabled=True,
+                                className="a11y-target",
                                 style={"padding": "10px 18px", "fontWeight": 600},
+                                title="Submit reflection",
+                                **{"aria-label": "Submit reflection"},
                             ),
                             html.Span(
                                 "Saved",
@@ -858,7 +1021,7 @@ def _serve_layout() -> html.Div:
             ),
             html.Div(
                 [
-                    html.H3("Trace History"),
+                    html.H3("History"),
                     html.Div(
                         "Trace history will appear here.",
                         id="trace-history",
@@ -907,12 +1070,106 @@ def _serve_layout() -> html.Div:
             dcc.Store(id="store-reflection-status", data=_default_reflection_status()),
             dcc.Store(id="store-reflection-commit", data=None),
             dcc.Store(id="store-reflection-ack", data=None),
+            dcc.Store(id="store-about", storage_type="local", data=_default_about_state()),
             dcc.Interval(id="interval-verbal-a", interval=500, n_intervals=0, disabled=True),
             dcc.Interval(id="interval-reflect-saved", interval=500, n_intervals=0, disabled=True),
             dcc.Interval(id="interval-param-commit", interval=200, n_intervals=0, disabled=True),
+            global_styles,
+            descriptions,
             html.Div(main_content, style={"padding": "32px"}),
             representations_section,
+            html.Div("", id="live-status", className="visually-hidden", role="status", **{"aria-live": "polite"}),
+            html.Div("", id="about-focus-anchor", style={"display": "none"}),
             _build_consent_modal(),
+            html.Div(
+                id="about-overlay",
+                n_clicks=0,
+                style={
+                    **_MODAL_OVERLAY_BASE_STYLE,
+                    "display": "none",
+                    "zIndex": 1200,
+                },
+                **{"aria-hidden": "true"},
+                children=[
+                    html.Div(
+                        [
+                            html.H2("About Function Explorer", id="about-modal-title", style={"marginTop": "0"}),
+                            html.P("We explore quadratics of the form y = ax^2 + bx + c."),
+                            html.Ul(
+                                [
+                                    html.Li("a (quadratic term): controls opening direction and width."),
+                                    html.Li("b (linear term): shifts the vertex left/right."),
+                                    html.Li("c (constant term): moves the graph up or down."),
+                                ],
+                                id="about-modal-desc",
+                                style={"paddingLeft": "20px"},
+                            ),
+                            html.P("Tip: drag slowly or use keyboard nudges to see how each coefficient shapes the curve."),
+                            html.Button(
+                                "Got it",
+                                id="btn-about-dismiss",
+                                n_clicks=0,
+                                className="a11y-target",
+                                style={"marginTop": "16px"},
+                            ),
+                            html.Button("", id="btn-about-esc", style={"display": "none"}),
+                        ],
+                        id="about-modal-panel",
+                        n_clicks=0,
+                        style={
+                            **_MODAL_PANEL_STYLE,
+                            "outline": "none",
+                        },
+                        role="dialog",
+                        **{
+                            "aria-modal": "true",
+                            "aria-labelledby": "about-modal-title",
+                            "aria-describedby": "about-modal-desc",
+                            "tabIndex": -1,
+                        },
+                    )
+                ],
+            ),
+            html.Button(
+                "i",
+                id="btn-about-info",
+                n_clicks=0,
+                className="about-info-button a11y-target",
+                title="About Function Explorer",
+                **{"aria-label": "Open About dialog"},
+            ),
+            html.Script(
+                """
+                (function() {
+                    if (window.__aboutModalEscAttached) {
+                        return;
+                    }
+                    window.__aboutModalEscAttached = true;
+                    var panel = document.getElementById("about-modal-panel");
+                    if (panel) {
+                        panel.addEventListener("click", function(event) {
+                            event.stopPropagation();
+                        });
+                    }
+                    document.addEventListener("keydown", function(event) {
+                        if (event.key === "Escape") {
+                            var overlay = document.getElementById("about-overlay");
+                            if (!overlay) {
+                                return;
+                            }
+                            var visible = overlay.style.display && overlay.style.display !== "none";
+                            if (visible) {
+                                var escButton = document.getElementById("btn-about-esc");
+                                if (escButton) {
+                                    escButton.click();
+                                }
+                            }
+                        }
+                    });
+                })();
+                """,
+                id="about-modal-script",
+            ),
             html.Script(
                 """
                 (function() {
@@ -995,6 +1252,84 @@ def _handle_consent_decision(accept_clicks, decline_clicks, consent_data, sessio
 def _toggle_consent_modal(consent_data):
     visible = not _is_modal_dismissed(consent_data)
     return _modal_overlay_style(visible)
+
+
+@app.callback(
+    Output("store-about", "data"),
+    Input("btn-about-info", "n_clicks"),
+    Input("btn-about-dismiss", "n_clicks"),
+    Input("about-overlay", "n_clicks"),
+    Input("btn-about-esc", "n_clicks"),
+    State("store-about", "data"),
+    prevent_initial_call=True,
+)
+def _handle_about_modal(info_clicks, dismiss_clicks, overlay_clicks, esc_clicks, about_data):
+    data = about_data if isinstance(about_data, dict) else _default_about_state()
+    data = dict(data)
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return data
+    trigger_id = ctx.triggered[0]["prop_id"].split(".")[0]
+    if trigger_id == "btn-about-info":
+        data["open"] = True
+        data["seen"] = True
+    elif trigger_id in {"btn-about-dismiss", "btn-about-esc"}:
+        data["open"] = False
+        data["seen"] = True
+    elif trigger_id == "about-overlay":
+        if data.get("open"):
+            data["open"] = False
+            data["seen"] = True
+    return data
+
+
+@app.callback(
+    Output("about-overlay", "style"),
+    Input("store-about", "data"),
+)
+def _sync_about_modal_style(about_data):
+    data = about_data if isinstance(about_data, dict) else _default_about_state()
+    style = dict(_MODAL_OVERLAY_BASE_STYLE)
+    style.update({"zIndex": 1200, "padding": "16px"})
+    style["display"] = "flex" if data.get("open") else "none"
+    return style
+
+
+app.clientside_callback(
+    """
+    function(state) {
+        const overlay = document.getElementById("about-overlay");
+        const dismissButton = document.getElementById("btn-about-dismiss");
+        const infoButton = document.getElementById("btn-about-info");
+        if (!state || typeof state !== "object") {
+            if (overlay) {
+                overlay.setAttribute("aria-hidden", "true");
+            }
+            return "";
+        }
+        const isOpen = Boolean(state.open);
+        if (overlay) {
+            overlay.setAttribute("aria-hidden", isOpen ? "false" : "true");
+        }
+        if (isOpen) {
+            setTimeout(function() {
+                if (dismissButton) {
+                    dismissButton.focus();
+                }
+            }, 0);
+        } else {
+            setTimeout(function() {
+                if (infoButton) {
+                    infoButton.focus();
+                }
+            }, 0);
+        }
+        return "";
+    }
+    """,
+    Output("about-focus-anchor", "children"),
+    Input("store-about", "data"),
+)
 
 
 app.clientside_callback(
@@ -1878,7 +2213,7 @@ app.clientside_callback(
                 y: [],
                 mode: "markers",
                 name: "Vertex",
-                marker: {color: "#EF553B", size: 10, line: {color: "#ffffff", width: 1}},
+                marker: {color: "#D55E00", size: 10, line: {color: "#ffffff", width: 1}},
                 hovertemplate: "Vertex<br>x=%{x:.2f}<br>y=%{y:.2f}<extra></extra>",
                 showlegend: false,
             };
@@ -1896,7 +2231,7 @@ app.clientside_callback(
                 y: [],
                 mode: "markers",
                 name: "Zeros",
-                marker: {color: "#00b5ad", size: 9, symbol: "x", line: {color: "#ffffff", width: 1}},
+                marker: {color: "#000000", size: 9, symbol: "x", line: {color: "#ffffff", width: 1}},
                 hovertemplate: "Zero<br>x=%{x:.2f}<extra></extra>",
                 showlegend: false,
             };
@@ -1904,7 +2239,7 @@ app.clientside_callback(
         zerosTrace.mode = "markers";
         zerosTrace.showlegend = false;
         if (!zerosTrace.marker) {
-            zerosTrace.marker = {color: "#00b5ad", size: 9, symbol: "x", line: {color: "#ffffff", width: 1}};
+            zerosTrace.marker = {color: "#000000", size: 9, symbol: "x", line: {color: "#ffffff", width: 1}};
         }
         zerosTrace.marker.symbol = zerosTrace.marker.symbol || "x";
         zerosTrace.hovertemplate = "Zero<br>x=%{x:.2f}<extra></extra>";
@@ -1934,7 +2269,7 @@ app.clientside_callback(
                     yref: "paper",
                     y0: 0,
                     y1: 1,
-                    line: {color: "#888888", width: 1, dash: "dash"},
+                    line: {color: "#777777", width: 1, dash: "dash"},
                 };
             } else {
                 vertexTrace.x = [];
@@ -1944,7 +2279,7 @@ app.clientside_callback(
             vertexTrace.x = [];
             vertexTrace.y = [];
             if (vertexToggleActive && isDegenerate) {
-                vertexNotice = "a = 0 → vertex/axis hidden (linear case).";
+            vertexNotice = "Vertex/axis hidden when a = 0 (linear case).";
             }
         }
 
@@ -2019,7 +2354,7 @@ app.clientside_callback(
             y: [],
             mode: "lines",
             name: "Trace",
-            line: {width: 1.5, color: "rgba(99,110,250,0.35)"},
+            line: {width: 1.5, color: "rgba(0,114,178,0.35)"},
             hoverinfo: "skip",
             showlegend: false,
         });
@@ -2044,7 +2379,7 @@ app.clientside_callback(
                 const fadeStep = overlayCapacity > 1 ? 0.35 / (overlayCapacity - 1) : 0.35;
                 const opacity = Math.max(0.08, baseOpacity - idx * fadeStep);
                 overlayTrace.line = Object.assign({}, overlayTrace.line || {}, {
-                    color: "rgba(99,110,250," + opacity.toFixed(3) + ")",
+                    color: "rgba(0,114,178," + opacity.toFixed(3) + ")",
                     width: 1.6,
                 });
                 overlayTrace.hoverinfo = "skip";
