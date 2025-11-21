@@ -2,54 +2,28 @@
 
 from __future__ import annotations
 
-import csv
-import io
 import json
 import time
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 import dash
 from dash import Input, Output, State, dcc, html
 import plotly.graph_objects as go
 
-# Quadratic sampling grid
-_X_MIN = -10.0
-_X_MAX = 10.0
-_NUM_SAMPLES = 401
+from function_explorer import config
+from function_explorer import graph_engine
+from function_explorer import logger
 
-_DEFAULT_PARAMS: Dict[str, float] = {"a": 1.0, "b": 0.0, "c": 0.0}
-_UI_BASE_TOKEN = "quadratic-"
-_DEFAULT_UI_NONCE = "0"
-_DEFAULT_CONSENT_STATE: Dict[str, Any] = {
-    "granted": False,
-    "declined": False,
-    "timestamp_utc": None,
-}
-_PARAM_BOUNDS: Dict[str, Dict[str, float]] = {
-    "b": {"min": -10.0, "max": 10.0, "step": 0.1},
-    "a": {"min": -5.0, "max": 5.0, "step": 0.1},
-    "c": {"min": -10.0, "max": 10.0, "step": 0.1},
-}
 _SOURCE_STORE_DEFAULT: Dict[str, Any] = {
     "param": None,
     "source": None,
     "value": None,
     "t": None,
 }
-_TRACE_HISTORY_CAPACITY = 10
-_TRACE_STORE_DEFAULT: Dict[str, Any] = {"entries": [], "capacity": _TRACE_HISTORY_CAPACITY}
-
-_BASE_DIR = Path(__file__).resolve().parent
-_DATA_DIR = _BASE_DIR / "function_explorer" / "data"
-_LOG_RATE_LIMIT_SECONDS = 0.1  # ~10 Hz
 _MONOTONIC_ZERO = time.monotonic()
-_SCHEMA_VERSION = 1
-_FUNCTION_TYPE = "quadratic"
-_APP_MODE = "dash"
-_DEFAULT_INTERACTION_PHASE = "change"
 _THROTTLE_STATE: Dict[str, Dict[str, Any]] = {}
 _SESSION_PARAM_CACHE: Dict[str, Dict[str, float]] = {}
 _DEFAULT_OVERLAY_STATE = {"vertex_axis": True, "zeros": True, "trace": True}
@@ -75,47 +49,26 @@ _DEFAULT_REFLECTION_STATUS: Dict[str, Any] = {
     "last_ack_seq": None,
 }
 _LAST_REFLECTION_SEQ: Dict[str, int] = {}
-_SESSION_LOG_STATE: Dict[str, Dict[str, Any]] = {}
 _DEFAULT_ABOUT_STATE: Dict[str, Any] = {"seen": False, "open": True}
-_SCHEMA_COLUMNS: List[str] = [
-    "schema_version",
-    "session_id",
-    "t_client_ms",
-    "t_server_iso",
-    "seq",
-    "event",
-    "function_type",
-    "param_name",
-    "old_value",
-    "new_value",
-    "source",
-    "a",
-    "b",
-    "c",
-    "elapsed_time_ms",
-    "mode",
-    "interaction_phase",
-    "viewport_xrange_min",
-    "viewport_xrange_max",
-    "viewport_yrange_min",
-    "viewport_yrange_max",
-    "uirevision",
-    "reflection_text",
-    "chars",
-    "words",
-    "draft_total_ms",
-    "idle_to_submit_ms",
-    "edit_count",
-    "char_delta",
-    "paste_flag",
-    "accidental_focus_flag",
-    "consent_status",
-    "export_type",
-    "overlay",
-    "enabled",
-]
 
-_MATHJAX_CDN = "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"
+_X_MIN = config.X_MIN
+_X_MAX = config.X_MAX
+_NUM_SAMPLES = config.NUM_SAMPLES
+_DEFAULT_PARAMS = config.DEFAULT_PARAMS
+_PARAM_BOUNDS = config.PARAM_BOUNDS
+_UI_BASE_TOKEN = config.UI_BASE_TOKEN
+_DEFAULT_UI_NONCE = config.DEFAULT_UI_NONCE
+_DEFAULT_CONSENT_STATE = config.DEFAULT_CONSENT_STATE
+_TRACE_HISTORY_CAPACITY = config.TRACE_HISTORY_CAPACITY
+_TRACE_STORE_DEFAULT: Dict[str, Any] = dict(config.TRACE_STORE_DEFAULT)
+_DATA_DIR = config.DATA_DIR
+_SCHEMA_VERSION = config.SCHEMA_VERSION
+_FUNCTION_TYPE = config.FUNCTION_TYPE
+_APP_MODE = config.APP_MODE
+_DEFAULT_INTERACTION_PHASE = config.DEFAULT_INTERACTION_PHASE
+_LOG_RATE_LIMIT_SECONDS = config.LOG_RATE_LIMIT_SECONDS
+_SCHEMA_COLUMNS = config.SCHEMA_COLUMNS
+_MATHJAX_CDN = config.MATHJAX_CDN
 
 _MODAL_OVERLAY_BASE_STYLE: Dict[str, Any] = {
     "position": "fixed",
@@ -138,25 +91,7 @@ _MODAL_PANEL_STYLE: Dict[str, Any] = {
 }
 
 
-def _generate_x_samples(x_min: float, x_max: float, count: int) -> List[float]:
-    if count < 2:
-        return [x_min]
-    step = (x_max - x_min) / (count - 1)
-    return [x_min + i * step for i in range(count)]
-
-
-_X_GRID = _generate_x_samples(_X_MIN, _X_MAX, _NUM_SAMPLES)
-
-
-def _evaluate_quadratic(a: float, b: float, c: float, xs: List[float]) -> List[float]:
-    return [a * (x ** 2) + b * x + c for x in xs]
-
-
-def _coerce_float(value: Any) -> Optional[float]:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+_X_GRID = graph_engine.generate_x_grid()
 
 
 def _get_session_id(session_data: Optional[Dict[str, Any]]) -> str:
@@ -213,28 +148,7 @@ def _safe_session_id(session_id: Optional[str]) -> str:
 
 def _get_session_log_path(session_id: str) -> Path:
     safe_id = _safe_session_id(session_id)
-    return _DATA_DIR / f"session_{safe_id}.jsonl"
-
-
-def _normalize_param_value(param: str, value: Any) -> float:
-    cfg = _PARAM_BOUNDS.get(param, {"min": -10.0, "max": 10.0, "step": 0.1})
-    try:
-        num = float(value)
-    except (TypeError, ValueError):
-        num = float(_DEFAULT_PARAMS.get(param, 0.0))
-    num = max(cfg["min"], min(cfg["max"], num))
-    step = cfg.get("step", 0.1) or 0.1
-    quantized = round(num / step) * step
-    if quantized == -0.0:
-        quantized = 0.0
-    return float(f"{quantized:.12g}")
-
-
-def _normalize_params(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
-    params = {}
-    for key, default_val in _DEFAULT_PARAMS.items():
-        params[key] = _normalize_param_value(key, (raw or {}).get(key, default_val))
-    return params
+    return logger.session_log_path(safe_id)
 
 
 def _compute_viewport_fields(viewport: Optional[Dict[str, Any]]) -> Dict[str, Optional[float]]:
@@ -280,20 +194,7 @@ def _figure_uirevision(fig: Any, ui_store: Optional[Dict[str, Any]]) -> str:
 
 def _next_seq_and_elapsed(session_id: str, t_client_ms: Optional[int]) -> Dict[str, Any]:
     safe_id = _safe_session_id(session_id)
-    state = _SESSION_LOG_STATE.setdefault(
-        safe_id, {"seq": 0, "last_t_client": None, "last_t_server_ms": None}
-    )
-    now_ms = int(time.time() * 1000)
-    seq = state["seq"] + 1
-    state["seq"] = seq
-    elapsed = 0
-    if t_client_ms is not None and state["last_t_client"] is not None:
-        elapsed = max(int(t_client_ms - state["last_t_client"]), 0)
-    elif state["last_t_server_ms"] is not None:
-        elapsed = max(now_ms - state["last_t_server_ms"], 0)
-    state["last_t_client"] = t_client_ms
-    state["last_t_server_ms"] = now_ms
-    return {"seq": seq, "elapsed_time_ms": elapsed, "t_server_iso": _current_timestamp(), "now_ms": now_ms}
+    return logger.next_seq_and_elapsed(safe_id, t_client_ms)
 
 
 def _build_log_record(
@@ -312,9 +213,9 @@ def _build_log_record(
     consent_granted: bool,
 ) -> Dict[str, Any]:
     safe_id = _safe_session_id(session_id)
-    norm_params = _normalize_params(params)
-    norm_old = _normalize_param_value(param_name, old_value) if param_name else None
-    norm_new = _normalize_param_value(param_name, new_value) if param_name else None
+    norm_params = logger.normalize_params(params)
+    norm_old = logger.normalize_param_value(param_name, old_value) if param_name else None
+    norm_new = logger.normalize_param_value(param_name, new_value) if param_name else None
     seq_meta = _next_seq_and_elapsed(safe_id, t_client_ms)
     vp_fields = _compute_viewport_fields(viewport)
     record: Dict[str, Any] = {
@@ -359,11 +260,8 @@ def _build_log_record(
 def _write_log_record(session_id: str, record: Dict[str, Any]) -> None:
     safe_id = _safe_session_id(session_id)
     try:
-        _DATA_DIR.mkdir(parents=True, exist_ok=True)
         path = _get_session_log_path(safe_id)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-            fh.flush()
+        logger.append_jsonl(path, record)
     except Exception as exc:
         print("[dash-log]", exc, record)
 
@@ -378,11 +276,6 @@ def _process_log_record(
     preview = _append_preview_log(log_store_data, _format_preview_message(record))
     diag = _append_diag_log(diag_store_data, record)
     return {"preview": preview, "diag": diag}
-
-
-def _current_timestamp() -> str:
-    ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-    return ts.replace("+00:00", "Z")
 
 
 def _resolve_uirevision_value(ui_store: Optional[Dict[str, Any]]) -> str:
@@ -424,25 +317,6 @@ def _read_session_log_records(session_id: str) -> List[Dict[str, Any]]:
     return records
 
 
-def _flatten_record_for_csv(record: Dict[str, Any]) -> Dict[str, Any]:
-    flat = dict.fromkeys(_SCHEMA_COLUMNS, None)
-    for key, value in record.items():
-        if key in flat:
-            flat[key] = value
-    return flat
-
-
-def _build_csv_content(records: List[Dict[str, Any]]) -> Optional[str]:
-    if not records:
-        return None
-    rows = [_flatten_record_for_csv(rec) for rec in records]
-    columns = list(_SCHEMA_COLUMNS)
-    buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore")
-    writer.writeheader()
-    for row in rows:
-        writer.writerow({col: row.get(col) for col in columns})
-    return buffer.getvalue()
 
 
 def _is_toggle_enabled(value: Any) -> bool:
@@ -585,69 +459,8 @@ def _bump_uirevision_store(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _build_figure(params: Dict[str, float], xs: List[float], uirevision: str) -> go.Figure:
-    ys = _evaluate_quadratic(params["a"], params["b"], params["c"], xs)
-    fig = go.Figure(
-        data=[
-            go.Scatter(
-                x=xs,
-                y=ys,
-                mode="lines",
-                name="y = ax^2 + bx + c",
-                line=dict(color="#0072B2", width=3),
-            ),
-            go.Scatter(
-                x=[],
-                y=[],
-                mode="markers",
-                name="Vertex",
-                marker=dict(color="#D55E00", size=10, symbol="circle", line=dict(color="#ffffff", width=1)),
-                hovertemplate="Vertex<br>x=%{x:.2f}<br>y=%{y:.2f}<extra></extra>",
-                showlegend=False,
-            ),
-            go.Scatter(
-                x=[],
-                y=[],
-                mode="markers",
-                name="Zeros",
-                marker=dict(color="#000000", size=9, symbol="x", line=dict(color="#ffffff", width=1)),
-                hovertemplate="Zero<br>x=%{x:.2f}<extra></extra>",
-                showlegend=False,
-            ),
-        ]
-    )
-    for _ in range(_TRACE_HISTORY_CAPACITY):
-        fig.add_trace(
-            go.Scatter(
-                x=[],
-                y=[],
-                mode="lines",
-                name="Trace",
-                line=dict(color="rgba(0,114,178,0.35)", width=1.5),
-                opacity=0.35,
-                hoverinfo="skip",
-                showlegend=False,
-            )
-        )
-    fig.update_layout(
-        height=560,
-        margin=dict(l=36, r=16, t=32, b=32),
-        xaxis=dict(
-            title="x",
-            showgrid=True,
-            zeroline=True,
-            zerolinecolor="#777777",
-        ),
-        yaxis=dict(
-            title="y",
-            showgrid=True,
-            zeroline=True,
-            zerolinecolor="#777777",
-        ),
-        showlegend=False,
-        uirevision=uirevision,
-        shapes=[],
-    )
-    return fig
+    ys = graph_engine.evaluate_quadratic(params["a"], params["b"], params["c"], xs)
+    return graph_engine.build_figure(xs, ys, uirevision=uirevision, trace_capacity=_TRACE_HISTORY_CAPACITY)
 
 
 _INITIAL_FIGURE = _build_figure(
@@ -945,17 +758,17 @@ textarea:focus-visible,
             html.Div(
                 [
                     html.Button("Download JSONL", id="btn-download-jsonl", n_clicks=0),
-                    html.Button(
-                        "Download CSV",
-                        id="btn-download-csv",
-                        n_clicks=0,
-                        style={"marginLeft": "8px"},
-                    ),
-                    dcc.Download(id="download-jsonl"),
-                    dcc.Download(id="download-csv"),
-                ],
-                style={"marginTop": "16px"},
+            html.Button(
+                "Download CSV",
+                id="btn-download-csv",
+                n_clicks=0,
+                style={"marginLeft": "8px"},
             ),
+            dcc.Download(id="download-jsonl"),
+            dcc.Download(id="download-csv"),
+        ],
+        style={"marginTop": "16px"},
+    ),
             html.Details(
                 [
                     html.Summary("Diagnostics (last 10 rows)"),
@@ -3391,10 +3204,10 @@ def _log_param_commit(commit_data, session_data, consent_data, ui_store_data, lo
         "b": commit_data.get("b"),
         "c": commit_data.get("c"),
     }
-    norm_params = _normalize_params(params)
+    norm_params = logger.normalize_params(params)
     _SESSION_PARAM_CACHE[session_id] = dict(norm_params)
-    norm_old = _normalize_param_value(param_name, commit_data.get("old_value"))
-    norm_new = _normalize_param_value(param_name, commit_data.get("new_value"))
+    norm_old = logger.normalize_param_value(param_name, commit_data.get("old_value"))
+    norm_new = logger.normalize_param_value(param_name, commit_data.get("new_value"))
     if norm_old is not None and norm_new is not None and abs(norm_old - norm_new) < 1e-9:
         return dash.no_update, dash.no_update
 
@@ -3563,7 +3376,7 @@ def _handle_download_csv(n_clicks, session_data, consent_data, ui_store_data, lo
         return dash.no_update, dash.no_update, dash.no_update
     session_id = _get_session_id(session_data)
     records = _read_session_log_records(session_id)
-    csv_content = _build_csv_content(records)
+    csv_content = logger.build_csv_content(records)
     if not csv_content:
         return dash.no_update, dash.no_update, dash.no_update
 
@@ -3585,6 +3398,8 @@ def _handle_download_csv(n_clicks, session_data, consent_data, ui_store_data, lo
     result = _process_log_record(session_id, record, log_store_data, diag_store_data)
     filename = f"session_{_safe_session_id(session_id)}.csv"
     return dcc.send_string(csv_content, filename=filename), result["preview"], result["diag"]
+
+
 
 
 @app.callback(
@@ -3624,7 +3439,7 @@ def _handle_reset(n_clicks, ui_store_data, session_data, consent_data, log_store
 
     updated_ui_store = _bump_uirevision_store(ui_store_data)
     session_id = _get_session_id(session_data)
-    norm_defaults = _normalize_params(_DEFAULT_PARAMS)
+    norm_defaults = logger.normalize_params(_DEFAULT_PARAMS)
     _SESSION_PARAM_CACHE[session_id] = dict(norm_defaults)
     log_update = dash.no_update
     diag_update = dash.no_update
@@ -3711,7 +3526,7 @@ def _render_diagnostics(diag_data, a_value, b_value, c_value):
     drift = False
     try:
         drift = any(
-            abs(_normalize_param_value(k, v) - float(latest.get(k))) > 1e-9
+            abs(logger.normalize_param_value(k, v) - float(latest.get(k))) > 1e-9
             for k, v in [("a", a_value), ("b", b_value), ("c", c_value)]
         )
     except Exception:
