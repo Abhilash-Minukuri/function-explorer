@@ -5,7 +5,6 @@ from __future__ import annotations
 import csv
 import io
 import json
-import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -30,8 +29,8 @@ _DEFAULT_CONSENT_STATE: Dict[str, Any] = {
     "timestamp_utc": None,
 }
 _PARAM_BOUNDS: Dict[str, Dict[str, float]] = {
-    "a": {"min": -5.0, "max": 5.0, "step": 0.1},
     "b": {"min": -10.0, "max": 10.0, "step": 0.1},
+    "a": {"min": -5.0, "max": 5.0, "step": 0.1},
     "c": {"min": -10.0, "max": 10.0, "step": 0.1},
 }
 _SOURCE_STORE_DEFAULT: Dict[str, Any] = {
@@ -49,7 +48,7 @@ _LOG_RATE_LIMIT_SECONDS = 0.1  # ~10 Hz
 _MONOTONIC_ZERO = time.monotonic()
 _SCHEMA_VERSION = 1
 _FUNCTION_TYPE = "quadratic"
-_APP_MODE = "dash-hybrid"
+_APP_MODE = "dash"
 _DEFAULT_INTERACTION_PHASE = "change"
 _THROTTLE_STATE: Dict[str, Dict[str, Any]] = {}
 _SESSION_PARAM_CACHE: Dict[str, Dict[str, float]] = {}
@@ -76,18 +75,24 @@ _DEFAULT_REFLECTION_STATUS: Dict[str, Any] = {
     "last_ack_seq": None,
 }
 _LAST_REFLECTION_SEQ: Dict[str, int] = {}
+_SESSION_LOG_STATE: Dict[str, Dict[str, Any]] = {}
 _DEFAULT_ABOUT_STATE: Dict[str, Any] = {"seen": False, "open": True}
-_CSV_BASE_COLUMNS: List[str] = [
+_SCHEMA_COLUMNS: List[str] = [
     "schema_version",
     "session_id",
-    "timestamp",
-    "function_type",
+    "t_client_ms",
+    "t_server_iso",
+    "seq",
     "event",
+    "function_type",
     "param_name",
     "old_value",
     "new_value",
     "source",
-    "elapsed_time",
+    "a",
+    "b",
+    "c",
+    "elapsed_time_ms",
     "mode",
     "interaction_phase",
     "viewport_xrange_min",
@@ -104,7 +109,10 @@ _CSV_BASE_COLUMNS: List[str] = [
     "char_delta",
     "paste_flag",
     "accidental_focus_flag",
-    "t_client",
+    "consent_status",
+    "export_type",
+    "overlay",
+    "enabled",
 ]
 
 _MATHJAX_CDN = "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"
@@ -208,6 +216,146 @@ def _get_session_log_path(session_id: str) -> Path:
     return _DATA_DIR / f"session_{safe_id}.jsonl"
 
 
+def _normalize_param_value(param: str, value: Any) -> float:
+    cfg = _PARAM_BOUNDS.get(param, {"min": -10.0, "max": 10.0, "step": 0.1})
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        num = float(_DEFAULT_PARAMS.get(param, 0.0))
+    num = max(cfg["min"], min(cfg["max"], num))
+    step = cfg.get("step", 0.1) or 0.1
+    quantized = round(num / step) * step
+    if quantized == -0.0:
+        quantized = 0.0
+    return float(f"{quantized:.12g}")
+
+
+def _normalize_params(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    params = {}
+    for key, default_val in _DEFAULT_PARAMS.items():
+        params[key] = _normalize_param_value(key, (raw or {}).get(key, default_val))
+    return params
+
+
+def _compute_viewport_fields(viewport: Optional[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    x_min = x_max = y_min = y_max = None
+    if isinstance(viewport, dict):
+        xrange = viewport.get("xrange")
+        yrange = viewport.get("yrange")
+        if isinstance(xrange, Sequence) and len(xrange) == 2:
+            x_min, x_max = xrange
+        if isinstance(yrange, Sequence) and len(yrange) == 2:
+            y_min, y_max = yrange
+    return {
+        "viewport_xrange_min": x_min,
+        "viewport_xrange_max": x_max,
+        "viewport_yrange_min": y_min,
+        "viewport_yrange_max": y_max,
+    }
+
+
+def _extract_viewport_from_figure(fig: Any) -> Dict[str, Any]:
+    if not isinstance(fig, dict):
+        return {}
+    layout = fig.get("layout") if isinstance(fig.get("layout"), dict) else {}
+    xaxis = layout.get("xaxis", {}) if isinstance(layout, dict) else {}
+    yaxis = layout.get("yaxis", {}) if isinstance(layout, dict) else {}
+    viewport = {}
+    if isinstance(xaxis, dict) and isinstance(xaxis.get("range"), (list, tuple)) and len(xaxis["range"]) == 2:
+        viewport["xrange"] = xaxis["range"]
+    if isinstance(yaxis, dict) and isinstance(yaxis.get("range"), (list, tuple)) and len(yaxis["range"]) == 2:
+        viewport["yrange"] = yaxis["range"]
+    return viewport
+
+
+def _figure_uirevision(fig: Any, ui_store: Optional[Dict[str, Any]]) -> str:
+    if isinstance(fig, dict):
+        layout = fig.get("layout")
+        if isinstance(layout, dict):
+            raw = layout.get("uirevision")
+            if raw is not None:
+                return raw
+    return _resolve_uirevision_value(ui_store)
+
+
+def _next_seq_and_elapsed(session_id: str, t_client_ms: Optional[int]) -> Dict[str, Any]:
+    safe_id = _safe_session_id(session_id)
+    state = _SESSION_LOG_STATE.setdefault(
+        safe_id, {"seq": 0, "last_t_client": None, "last_t_server_ms": None}
+    )
+    now_ms = int(time.time() * 1000)
+    seq = state["seq"] + 1
+    state["seq"] = seq
+    elapsed = 0
+    if t_client_ms is not None and state["last_t_client"] is not None:
+        elapsed = max(int(t_client_ms - state["last_t_client"]), 0)
+    elif state["last_t_server_ms"] is not None:
+        elapsed = max(now_ms - state["last_t_server_ms"], 0)
+    state["last_t_client"] = t_client_ms
+    state["last_t_server_ms"] = now_ms
+    return {"seq": seq, "elapsed_time_ms": elapsed, "t_server_iso": _current_timestamp(), "now_ms": now_ms}
+
+
+def _build_log_record(
+    session_id: str,
+    *,
+    event: str,
+    param_name: Optional[str],
+    old_value: Optional[Any],
+    new_value: Optional[Any],
+    source: str,
+    params: Dict[str, Any],
+    t_client_ms: Optional[int],
+    viewport: Optional[Dict[str, Any]],
+    uirevision: Optional[str],
+    extras: Optional[Dict[str, Any]],
+    consent_granted: bool,
+) -> Dict[str, Any]:
+    safe_id = _safe_session_id(session_id)
+    norm_params = _normalize_params(params)
+    norm_old = _normalize_param_value(param_name, old_value) if param_name else None
+    norm_new = _normalize_param_value(param_name, new_value) if param_name else None
+    seq_meta = _next_seq_and_elapsed(safe_id, t_client_ms)
+    vp_fields = _compute_viewport_fields(viewport)
+    record: Dict[str, Any] = {
+        "schema_version": _SCHEMA_VERSION,
+        "session_id": safe_id,
+        "t_client_ms": int(t_client_ms) if t_client_ms is not None else seq_meta["now_ms"],
+        "t_server_iso": seq_meta["t_server_iso"],
+        "seq": seq_meta["seq"],
+        "event": event,
+        "function_type": _FUNCTION_TYPE,
+        "param_name": param_name,
+        "old_value": norm_old,
+        "new_value": norm_new,
+        "source": source,
+        "a": norm_params.get("a"),
+        "b": norm_params.get("b"),
+        "c": norm_params.get("c"),
+        "elapsed_time_ms": seq_meta["elapsed_time_ms"],
+        "mode": _APP_MODE,
+        "interaction_phase": _DEFAULT_INTERACTION_PHASE,
+        **vp_fields,
+        "uirevision": uirevision,
+        "reflection_text": None,
+        "chars": None,
+        "words": None,
+        "draft_total_ms": None,
+        "idle_to_submit_ms": None,
+        "edit_count": None,
+        "char_delta": None,
+        "paste_flag": None,
+        "accidental_focus_flag": None,
+        "consent_status": bool(consent_granted),
+        "export_type": None,
+        "overlay": None,
+        "enabled": None,
+    }
+    if extras:
+        record.update(extras)
+    return record
+
+
 def _write_log_record(session_id: str, record: Dict[str, Any]) -> None:
     safe_id = _safe_session_id(session_id)
     try:
@@ -215,57 +363,26 @@ def _write_log_record(session_id: str, record: Dict[str, Any]) -> None:
         path = _get_session_log_path(safe_id)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            fh.flush()
     except Exception as exc:
         print("[dash-log]", exc, record)
 
 
-def _flush_pending_record(session_id: str) -> None:
-    state = _THROTTLE_STATE.get(session_id)
-    if not state:
-        return
-    state["timer"] = None
-    pending = state.get("pending")
-    if not pending:
-        return
-    _write_log_record(session_id, pending)
-    state["pending"] = None
-    state["last_ts"] = time.monotonic()
-
-
-def _log_with_throttle(session_id: str, record: Dict[str, Any]) -> None:
-    state = _THROTTLE_STATE.setdefault(
-        session_id,
-        {"last_ts": 0.0, "pending": None, "timer": None},
-    )
-    now = time.monotonic()
-    since_last = now - state["last_ts"]
-    if since_last >= _LOG_RATE_LIMIT_SECONDS:
-        _write_log_record(session_id, record)
-        state["last_ts"] = now
-        state["pending"] = None
-        timer = state.get("timer")
-        if timer:
-            timer.cancel()
-            state["timer"] = None
-        return
-
-    state["pending"] = record
-    if state.get("timer"):
-        return
-    delay = max(_LOG_RATE_LIMIT_SECONDS - since_last, 0.01)
-    timer = threading.Timer(delay, _flush_pending_record, args=(session_id,))
-    timer.daemon = True
-    state["timer"] = timer
-    timer.start()
+def _process_log_record(
+    session_id: str,
+    record: Dict[str, Any],
+    log_store_data: Any,
+    diag_store_data: Any,
+) -> Dict[str, Any]:
+    _write_log_record(session_id, record)
+    preview = _append_preview_log(log_store_data, _format_preview_message(record))
+    diag = _append_diag_log(diag_store_data, record)
+    return {"preview": preview, "diag": diag}
 
 
 def _current_timestamp() -> str:
     ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
     return ts.replace("+00:00", "Z")
-
-
-def _elapsed_ms() -> int:
-    return int((time.monotonic() - _MONOTONIC_ZERO) * 1000)
 
 
 def _resolve_uirevision_value(ui_store: Optional[Dict[str, Any]]) -> str:
@@ -275,39 +392,6 @@ def _resolve_uirevision_value(ui_store: Optional[Dict[str, Any]]) -> str:
         if raw is not None:
             nonce = str(raw)
     return f"{_UI_BASE_TOKEN}{nonce}"
-
-
-def _base_log_record(
-    session_id: str,
-    *,
-    event: str,
-    param_name: Optional[str] = None,
-    old_value: Optional[Any] = None,
-    new_value: Optional[Any] = None,
-    source: str = "system",
-    uirevision: Optional[str] = None,
-    viewport: Optional[Dict[str, Any]] = None,
-    extras: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    record: Dict[str, Any] = {
-        "schema_version": _SCHEMA_VERSION,
-        "session_id": _safe_session_id(session_id),
-        "timestamp": _current_timestamp(),
-        "function_type": _FUNCTION_TYPE,
-        "event": event,
-        "param_name": param_name,
-        "old_value": old_value,
-        "new_value": new_value,
-        "source": source,
-        "elapsed_time": _elapsed_ms(),
-        "mode": _APP_MODE,
-        "interaction_phase": _DEFAULT_INTERACTION_PHASE,
-        "viewport": viewport,
-        "uirevision": uirevision,
-    }
-    if extras:
-        record.update(extras)
-    return record
 
 
 def _get_param_cache(session_id: str) -> Dict[str, float]:
@@ -341,30 +425,10 @@ def _read_session_log_records(session_id: str) -> List[Dict[str, Any]]:
 
 
 def _flatten_record_for_csv(record: Dict[str, Any]) -> Dict[str, Any]:
-    flat = dict(record)
-    viewport = flat.pop("viewport", None)
-    x_min = x_max = y_min = y_max = None
-    if isinstance(viewport, dict):
-        xrange = viewport.get("xrange")
-        yrange = viewport.get("yrange")
-        if isinstance(xrange, Sequence) and len(xrange) == 2:
-            x_min, x_max = xrange
-        if isinstance(yrange, Sequence) and len(yrange) == 2:
-            y_min, y_max = yrange
-    flat["viewport_xrange_min"] = x_min
-    flat["viewport_xrange_max"] = x_max
-    flat["viewport_yrange_min"] = y_min
-    flat["viewport_yrange_max"] = y_max
-    flat["reflection_text"] = record.get("reflection_text")
-    flat["chars"] = record.get("chars")
-    flat["words"] = record.get("words")
-    flat["draft_total_ms"] = record.get("draft_total_ms")
-    flat["idle_to_submit_ms"] = record.get("idle_to_submit_ms")
-    flat["edit_count"] = record.get("edit_count")
-    flat["char_delta"] = record.get("char_delta")
-    flat["paste_flag"] = record.get("paste_flag")
-    flat["accidental_focus_flag"] = record.get("accidental_focus_flag")
-    flat["t_client"] = record.get("t_client")
+    flat = dict.fromkeys(_SCHEMA_COLUMNS, None)
+    for key, value in record.items():
+        if key in flat:
+            flat[key] = value
     return flat
 
 
@@ -372,11 +436,7 @@ def _build_csv_content(records: List[Dict[str, Any]]) -> Optional[str]:
     if not records:
         return None
     rows = [_flatten_record_for_csv(rec) for rec in records]
-    columns = list(_CSV_BASE_COLUMNS)
-    for row in rows:
-        for key in row.keys():
-            if key not in columns:
-                columns.append(key)
+    columns = list(_SCHEMA_COLUMNS)
     buffer = io.StringIO()
     writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore")
     writer.writeheader()
@@ -412,6 +472,23 @@ def _append_preview_log(log_data: Any, message: str) -> List[str]:
     entries = list(entries)
     entries.append(message)
     return entries[-5:]
+
+
+def _append_diag_log(diag_data: Any, record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if isinstance(diag_data, list):
+        entries = diag_data[-9:]
+    else:
+        entries = []
+    entries = list(entries)
+    entries.append(record)
+    return entries[-10:]
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _format_preview_message(record: Dict[str, Any]) -> str:
@@ -879,6 +956,25 @@ textarea:focus-visible,
                 ],
                 style={"marginTop": "16px"},
             ),
+            html.Details(
+                [
+                    html.Summary("Diagnostics (last 10 rows)"),
+                    html.Pre(
+                        "No logs yet.",
+                        id="diagnostics-panel",
+                        style={
+                            "backgroundColor": "#f9f9f9",
+                            "padding": "8px",
+                            "borderRadius": "6px",
+                            "border": "1px solid #e0e0e0",
+                            "fontSize": "0.85rem",
+                            "overflowX": "auto",
+                        },
+                    ),
+                ],
+                open=False,
+                style={"marginTop": "12px"},
+            ),
         ],
         style={"flex": "2", "minWidth": "0"},
     )
@@ -898,10 +994,56 @@ textarea:focus-visible,
             html.Div(
                 [
                     html.H3("Equation"),
-                    dcc.Markdown(
-                        "y = x²",
-                        id="equation-view",
-                        style={"fontSize": "1.15rem", "marginTop": "8px"},
+                    html.Div(
+                        [
+                            dcc.Markdown(
+                                "y = x²",
+                                id="equation-view",
+                                style={"fontSize": "1.15rem", "marginTop": "8px"},
+                            ),
+                            html.Span(
+                                "No real zeros.",
+                                id="chip-no-real-zeros",
+                                role="status",
+                                **{"aria-live": "polite"},
+                                style={
+                                    "marginTop": "8px",
+                                    "padding": "4px 10px",
+                                    "borderRadius": "999px",
+                                    "fontSize": "0.9rem",
+                                    "backgroundColor": "#fff4e5",
+                                    "color": "#8a4b00",
+                                    "border": "1px solid #f3c98b",
+                                    "display": "inline-flex",
+                                    "alignItems": "center",
+                                    "gap": "4px",
+                                    "visibility": "hidden",
+                                },
+                            ),
+                        ],
+                        style={
+                            "display": "flex",
+                            "alignItems": "center",
+                            "gap": "8px",
+                            "flexWrap": "wrap",
+                        },
+                    ),
+                    html.Div(
+                        "Quadratic collapsed to linear (vertex/zeros may be hidden).",
+                        id="edge-linear-banner",
+                        role="status",
+                        **{"aria-live": "polite"},
+                        style={
+                            "marginTop": "6px",
+                            "padding": "8px 12px",
+                            "backgroundColor": "#e6f0ff",
+                            "border": "1px solid #a9c7ff",
+                            "borderRadius": "6px",
+                            "fontSize": "0.95rem",
+                            "color": "#0b3d91",
+                            "display": "block",
+                            "visibility": "hidden",
+                        },
                     ),
                     html.Div(
                         "",
@@ -1071,6 +1213,7 @@ textarea:focus-visible,
             dcc.Store(id="store-reflection-commit", data=None),
             dcc.Store(id="store-reflection-ack", data=None),
             dcc.Store(id="store-about", storage_type="local", data=_default_about_state()),
+            dcc.Store(id="store-log-diagnostics", data=[]),
             dcc.Interval(id="interval-verbal-a", interval=500, n_intervals=0, disabled=True),
             dcc.Interval(id="interval-reflect-saved", interval=500, n_intervals=0, disabled=True),
             dcc.Interval(id="interval-param-commit", interval=200, n_intervals=0, disabled=True),
@@ -1229,19 +1372,6 @@ def _handle_consent_decision(accept_clicks, decline_clicks, consent_data, sessio
         data["declined"] = True
         status = "declined"
 
-    session_id = _get_session_id(session_data)
-    record = _base_log_record(
-        session_id,
-        event="consent",
-        param_name=None,
-        old_value=None,
-        new_value=None,
-        source="button",
-        uirevision=_resolve_uirevision_value(ui_store_data),
-        viewport=None,
-        extras={"consent_status": status},
-    )
-    _write_log_record(session_id, record)
     return data
 
 
@@ -1605,10 +1735,19 @@ app.clientside_callback(
             const now = Date.now();
             const seq = status.next_seq || 1;
             const words = countWords(trimmed);
-            const draftStart = typeof draft.first_meaningful_edit_ts === "number" ? draft.first_meaningful_edit_ts : null;
-            const draftTotal = draftStart ? now - draftStart : null;
+            const draftStartRaw =
+                typeof draft.first_meaningful_edit_ts === "number"
+                    ? draft.first_meaningful_edit_ts
+                    : null;
+            const draftStart =
+                draftStartRaw !== null
+                    ? draftStartRaw
+                    : typeof draft.focused_ts === "number"
+                      ? draft.focused_ts
+                      : null;
+            const draftTotal = draftStart !== null ? now - draftStart : 0;
             const lastEdit = typeof draft.last_edit_ts === "number" ? draft.last_edit_ts : null;
-            const idleToSubmit = lastEdit ? now - lastEdit : null;
+            const idleToSubmit = lastEdit ? now - lastEdit : 0;
             const focusedTs = typeof draft.focused_ts === "number" ? draft.focused_ts : null;
             const accidentalFocus =
                 focusedTs !== null &&
@@ -1692,6 +1831,7 @@ app.clientside_callback(
 
             const paramOrder = ["a", "b", "c"];
             let changedParam = null;
+            let changedValue = null;
             paramOrder.forEach((key, idx) => {
                 const raw = Number(inputs[key]);
                 if (!isFinite(raw)) {
@@ -1705,31 +1845,34 @@ app.clientside_callback(
                     sliderOutputs[idx] = sanitized;
                     sliderValues[key] = sanitized;
                     changedParam = key;
+                    changedValue = sanitized;
                 }
             });
 
             let storeUpdate = window.dash_clientside.no_update;
             if (changedParam !== null) {
-                const recentSliderUpdate =
+                const recentSlider =
                     sourceStore &&
                     sourceStore.source === "slider" &&
                     sourceStore.param === changedParam;
-                const recentSliderVal = Number(
-                    sourceStore && sourceStore.value
-                );
-                const matchesRecentSlider =
-                    recentSliderUpdate &&
-                    isFinite(recentSliderVal) &&
-                    isFinite(sliderValues[changedParam]) &&
-                    Math.abs(recentSliderVal - sliderValues[changedParam]) < 1e-6;
-                const recentSliderAge =
-                    recentSliderUpdate && typeof sourceStore.t === "number"
+                const recentVal = Number(sourceStore && sourceStore.value);
+                const recentAge =
+                    recentSlider && typeof sourceStore.t === "number"
                         ? Date.now() - sourceStore.t
                         : Infinity;
-                const isLikelySliderEcho =
-                    matchesRecentSlider && recentSliderAge < 500;
-
-                const resolvedSource = isLikelySliderEcho ? "slider" : "input";
+                const matchesRecentSlider =
+                    recentSlider &&
+                    isFinite(recentVal) &&
+                    Math.abs(recentVal - sliderValues[changedParam]) < 1e-6;
+                const matchesChangedValue =
+                    recentSlider &&
+                    isFinite(recentVal) &&
+                    isFinite(changedValue) &&
+                    Math.abs(recentVal - changedValue) < 1e-6;
+                const treatAsSlider =
+                    recentSlider &&
+                    (matchesRecentSlider || matchesChangedValue || recentAge < 1200);
+                const resolvedSource = treatAsSlider ? "slider" : "input";
                 storeUpdate = {
                     param: changedParam,
                     source: resolvedSource,
@@ -2155,8 +2298,46 @@ app.clientside_callback(
         xs
     ) {
         const noUpdate = window.dash_clientside.no_update;
+        const EPS = 1e-6;
+        const makeBannerStyle = (visible) => ({
+            marginTop: "6px",
+            padding: "8px 12px",
+            backgroundColor: "#e6f0ff",
+            border: "1px solid #a9c7ff",
+            borderRadius: "6px",
+            fontSize: "0.95rem",
+            color: "#0b3d91",
+            display: "block",
+            visibility: visible ? "visible" : "hidden",
+        });
+        const makeChipStyle = (visible) => ({
+            marginTop: "8px",
+            padding: "4px 10px",
+            borderRadius: "999px",
+            fontSize: "0.9rem",
+            backgroundColor: "#fff4e5",
+            color: "#8a4b00",
+            border: "1px solid #f3c98b",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "4px",
+            visibility: visible ? "visible" : "hidden",
+        });
+        const bannerHiddenStyle = makeBannerStyle(false);
+        const bannerVisibleStyle = makeBannerStyle(true);
+        const chipHiddenStyle = makeChipStyle(false);
+        const chipVisibleStyle = makeChipStyle(true);
+
         if (!Array.isArray(xs) || xs.length === 0) {
-            return [noUpdate, noUpdate, noUpdate];
+            return [
+                noUpdate,
+                noUpdate,
+                noUpdate,
+                "",
+                bannerHiddenStyle,
+                "",
+                chipHiddenStyle,
+            ];
         }
 
         const fallback = {a: 1.0, b: 0.0, c: 0.0};
@@ -2176,16 +2357,32 @@ app.clientside_callback(
         var bNum = resolveValue(bSlider, bInput, "b");
         var cNum = resolveValue(cSlider, cInput, "c");
         if (!isFinite(aNum) || !isFinite(bNum) || !isFinite(cNum)) {
-            return [noUpdate, noUpdate, noUpdate];
+            return [
+                noUpdate,
+                noUpdate,
+                noUpdate,
+                "",
+                bannerHiddenStyle,
+                "",
+                chipHiddenStyle,
+            ];
         }
 
         if (!figure || !Array.isArray(figure.data) || figure.data.length === 0) {
-            return [noUpdate, noUpdate, noUpdate];
+            return [
+                noUpdate,
+                noUpdate,
+                noUpdate,
+                "",
+                bannerHiddenStyle,
+                "",
+                chipHiddenStyle,
+            ];
         }
 
         var baseTrace = figure.data[0];
         if (!baseTrace) {
-            return [noUpdate, noUpdate, noUpdate];
+            return [noUpdate, noUpdate, noUpdate, "", bannerHiddenStyle, "", chipHiddenStyle];
         }
 
         const isToggleOn = (value) => {
@@ -2271,9 +2468,13 @@ app.clientside_callback(
         };
 
         var aRounded = roundOneDecimal(aNum);
-        var isDegenerate = Math.abs(aRounded) < 1e-9;
+        var isDegenerate = Math.abs(aNum) < EPS;
         var vertexNotice = "";
         var zerosNotice = "";
+        var linearBannerText = "";
+        var linearBannerStyle = bannerHiddenStyle;
+        var zerosChipText = "";
+        var zerosChipStyle = chipHiddenStyle;
 
         var axisShape = null;
         if (vertexToggleActive && !isDegenerate) {
@@ -2309,19 +2510,30 @@ app.clientside_callback(
             vertexTrace.y = vertexTrace.y || [];
         }
 
+        if (isDegenerate) {
+            linearBannerText = "Quadratic collapsed to linear (vertex/zeros may be hidden).";
+            linearBannerStyle = bannerVisibleStyle;
+        }
+
+        const disc = bNum * bNum - 4 * aNum * cNum;
+        const noRealZeros = disc < -EPS;
+        const tangentZeros = Math.abs(disc) <= EPS;
+        if (noRealZeros) {
+            zerosChipText = "No real zeros.";
+            zerosChipStyle = chipVisibleStyle;
+        }
+
         if (zerosToggleActive) {
-            const DISC_EPS = 1e-10;
             var roots = [];
-            if (!isDegenerate) {
-                var disc = bNum * bNum - 4 * aNum * cNum;
-                if (disc > DISC_EPS) {
+            if (noRealZeros) {
+                zerosNotice = "No real zeros";
+            } else if (!isDegenerate) {
+                if (tangentZeros) {
+                    roots.push(-bNum / (2 * aNum));
+                } else if (disc > EPS) {
                     var sqrtDisc = Math.sqrt(disc);
                     roots.push((-bNum - sqrtDisc) / (2 * aNum));
                     roots.push((-bNum + sqrtDisc) / (2 * aNum));
-                } else if (Math.abs(disc) <= DISC_EPS) {
-                    roots.push(-bNum / (2 * aNum));
-                } else {
-                    zerosNotice = "No real zeros";
                 }
             } else {
                 var bRounded = roundOneDecimal(bNum);
@@ -2337,13 +2549,18 @@ app.clientside_callback(
                 }
             }
 
-            var finiteRoots = roots.filter((val) => isFinite(val));
-            zerosTrace.x = finiteRoots;
-            zerosTrace.y = finiteRoots.map(() => 0);
-            if (!finiteRoots.length && zerosNotice === "") {
-                zerosNotice = "No real zeros";
-            } else if (finiteRoots.length && zerosNotice !== "All x are zeros (degenerate y = 0).") {
-                zerosNotice = "";
+            if (noRealZeros) {
+                zerosTrace.x = [];
+                zerosTrace.y = [];
+            } else {
+                var finiteRoots = roots.filter((val) => isFinite(val));
+                zerosTrace.x = finiteRoots;
+                zerosTrace.y = finiteRoots.map(() => 0);
+                if (!finiteRoots.length && zerosNotice === "") {
+                    zerosNotice = "No real zeros";
+                } else if (finiteRoots.length && zerosNotice !== "All x are zeros (degenerate y = 0).") {
+                    zerosNotice = "";
+                }
             }
         } else {
             zerosTrace.x = [];
@@ -2416,13 +2633,25 @@ app.clientside_callback(
             zerosNotice = "";
         }
 
-        return [newFigure, vertexNotice, zerosNotice];
+        return [
+            newFigure,
+            vertexNotice,
+            zerosNotice,
+            linearBannerText,
+            linearBannerStyle,
+            zerosChipText,
+            zerosChipStyle,
+        ];
     }
     """,
     [
         Output("graph-main", "figure"),
         Output("vertex-notice", "children"),
         Output("zeros-notice", "children"),
+        Output("edge-linear-banner", "children"),
+        Output("edge-linear-banner", "style"),
+        Output("chip-no-real-zeros", "children"),
+        Output("chip-no-real-zeros", "style"),
     ],
     [
         Input("slider-a", "value"),
@@ -2528,6 +2757,12 @@ app.clientside_callback(
                     const prevLen = prevText.length;
                     const newLen = nextValue.length;
                     const delta = Math.abs(newLen - prevLen);
+                    if (draft.last_edit_ts && now - draft.last_edit_ts > 3000) {
+                        draft.first_meaningful_edit_ts = null;
+                        draft.initial_len = prevLen;
+                        draft.edit_count = 0;
+                        draft.paste_flag = false;
+                    }
                     draft.text = nextValue;
                     draft.last_edit_ts = now;
                     draft.edit_count = (draft.edit_count || 0) + 1;
@@ -2535,10 +2770,8 @@ app.clientside_callback(
                         draft.paste_flag = true;
                     }
                     const trimmedLen = nextValue.trim().length;
-                    if (!draft.first_meaningful_edit_ts) {
-                        if (trimmedLen >= 10 || delta >= 3) {
-                            draft.first_meaningful_edit_ts = now;
-                        }
+                    if (!draft.first_meaningful_edit_ts && trimmedLen > 0) {
+                        draft.first_meaningful_edit_ts = now;
                     }
                     if (trimmedLen > 0 && (!draft.initial_len || draft.initial_len < 0)) {
                         draft.initial_len = prevLen;
@@ -3050,6 +3283,7 @@ app.clientside_callback(
     [
         Output("store-reflection-ack", "data"),
         Output("store-log-sink", "data", allow_duplicate=True),
+        Output("store-log-diagnostics", "data", allow_duplicate=True),
     ],
     Input("store-reflection-commit", "data"),
     [
@@ -3057,147 +3291,145 @@ app.clientside_callback(
         State("store-consent", "data"),
         State("store-ui", "data"),
         State("store-log-sink", "data"),
+        State("store-log-diagnostics", "data"),
+        State("graph-main", "figure"),
     ],
     prevent_initial_call=True,
 )
-def _log_reflection_submit(commit_data, session_data, consent_data, ui_store_data, log_store_data):
+def _log_reflection_submit(commit_data, session_data, consent_data, ui_store_data, log_store_data, diag_store_data, figure):
     if not isinstance(commit_data, dict):
-        return dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update
     seq = commit_data.get("seq")
     try:
         seq_int = int(seq)
     except (TypeError, ValueError):
-        return dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update
 
     session_id = _get_session_id(session_data)
     safe_id = _safe_session_id(session_id)
     ack_payload: Dict[str, Any] = {"seq": seq_int, "status": "noop"}
     if not _is_logging_allowed(consent_data):
         ack_payload["status"] = "blocked_no_consent"
-        return ack_payload, dash.no_update
+        return ack_payload, dash.no_update, dash.no_update
 
     last_seq = _LAST_REFLECTION_SEQ.get(safe_id, 0)
     if seq_int <= last_seq:
         ack_payload["status"] = "duplicate"
-        return ack_payload, dash.no_update
+        return ack_payload, dash.no_update, dash.no_update
 
     reflection_text = (commit_data.get("reflection_text") or "").strip()
     if not reflection_text:
         ack_payload["status"] = "empty"
-        return ack_payload, dash.no_update
+        return ack_payload, dash.no_update, dash.no_update
 
-    chars = commit_data.get("chars")
-    try:
-        chars_int = int(chars)
-    except (TypeError, ValueError):
-        chars_int = len(reflection_text)
-    words = commit_data.get("words")
-    try:
-        words_int = int(words)
-    except (TypeError, ValueError):
-        words_int = len(reflection_text.split())
-
-    def _int_or_none(value: Any) -> Optional[int]:
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError):
-            return None
-        return parsed
+    chars_int = _int_or_none(commit_data.get("chars")) or len(reflection_text)
+    words_int = _int_or_none(commit_data.get("words")) or len(reflection_text.split())
 
     extras = {
         "reflection_text": reflection_text,
         "chars": chars_int,
         "words": words_int,
-        "draft_total_ms": _int_or_none(commit_data.get("draft_total_ms")),
-        "idle_to_submit_ms": _int_or_none(commit_data.get("idle_to_submit_ms")),
+        "draft_total_ms": _int_or_none(commit_data.get("draft_total_ms")) or 0,
+        "idle_to_submit_ms": _int_or_none(commit_data.get("idle_to_submit_ms")) or 0,
         "edit_count": _int_or_none(commit_data.get("edit_count")),
         "char_delta": _int_or_none(commit_data.get("char_delta")),
         "paste_flag": bool(commit_data.get("paste_flag")),
         "accidental_focus_flag": bool(commit_data.get("accidental_focus_flag")),
-        "t_client": _int_or_none(commit_data.get("t_client")),
     }
-    record = _base_log_record(
+    params = _get_param_cache(session_id)
+    viewport = _extract_viewport_from_figure(figure)
+    uirevision = _figure_uirevision(figure, ui_store_data)
+    record = _build_log_record(
         session_id,
         event="reflection_submit",
         param_name=None,
         old_value=None,
         new_value=None,
         source="input",
-        uirevision=_resolve_uirevision_value(ui_store_data),
-        viewport=None,
+        params=params,
+        t_client_ms=_int_or_none(commit_data.get("t_client")),
+        viewport=viewport,
+        uirevision=uirevision,
         extras=extras,
+        consent_granted=True,
     )
-    _write_log_record(session_id, record)
     _LAST_REFLECTION_SEQ[safe_id] = seq_int
+    result = _process_log_record(session_id, record, log_store_data, diag_store_data)
     ack_payload["status"] = "ok"
-    summary = _format_preview_message(record)
-    return ack_payload, _append_preview_log(log_store_data, summary)
+    return ack_payload, result["preview"], result["diag"]
 
 
 @app.callback(
-    Output("store-log-sink", "data", allow_duplicate=True),
-    Input("store-source", "data"),
     [
-        State("slider-a", "value"),
-        State("slider-b", "value"),
-        State("slider-c", "value"),
+        Output("store-log-sink", "data", allow_duplicate=True),
+        Output("store-log-diagnostics", "data", allow_duplicate=True),
+    ],
+    Input("store-param-commit", "data"),
+    [
         State("store-session", "data"),
         State("store-consent", "data"),
         State("store-ui", "data"),
         State("store-log-sink", "data"),
+        State("store-log-diagnostics", "data"),
+        State("graph-main", "figure"),
     ],
     prevent_initial_call=True,
 )
-def _log_slider_activity(source_store, a_value, b_value, c_value, session_data, consent_data, ui_store_data, log_store_data):
-    a_num = _coerce_float(a_value)
-    b_num = _coerce_float(b_value)
-    c_num = _coerce_float(c_value)
-    if a_num is None or b_num is None or c_num is None:
-        return dash.no_update
+def _log_param_commit(commit_data, session_data, consent_data, ui_store_data, log_store_data, diag_store_data, figure):
+    if not isinstance(commit_data, dict):
+        return dash.no_update, dash.no_update
     if not _is_logging_allowed(consent_data):
-        return dash.no_update
-
-    if not isinstance(source_store, dict):
-        return dash.no_update
-    param_name = source_store.get("param")
-    if param_name not in {"a", "b", "c"}:
-        return dash.no_update
+        return dash.no_update, dash.no_update
 
     session_id = _get_session_id(session_data)
-    current_values = {"a": a_num, "b": b_num, "c": c_num}
-    new_value = current_values.get(param_name)
-    if new_value is None:
-        return dash.no_update
+    param_name = commit_data.get("param")
+    if param_name not in {"a", "b", "c"}:
+        return dash.no_update, dash.no_update
 
-    try:
-        meta_value = float(source_store.get("value"))
-    except (TypeError, ValueError):
-        meta_value = None
-    if meta_value is None or abs(meta_value - new_value) > 1e-6:
-        return dash.no_update
+    params = {
+        "a": commit_data.get("a"),
+        "b": commit_data.get("b"),
+        "c": commit_data.get("c"),
+    }
+    norm_params = _normalize_params(params)
+    _SESSION_PARAM_CACHE[session_id] = dict(norm_params)
+    norm_old = _normalize_param_value(param_name, commit_data.get("old_value"))
+    norm_new = _normalize_param_value(param_name, commit_data.get("new_value"))
+    if norm_old is not None and norm_new is not None and abs(norm_old - norm_new) < 1e-9:
+        return dash.no_update, dash.no_update
 
-    cache = _get_param_cache(session_id)
-    old_value = cache.get(param_name)
-    source = _extract_source_label(source_store)
-    uirevision = _resolve_uirevision_value(ui_store_data)
-    record = _base_log_record(
+    source_raw = commit_data.get("source") or "slider"
+    allowed_sources = {"slider", "input", "stepper", "reset", "programmatic"}
+    source = source_raw if source_raw in allowed_sources else "programmatic"
+    viewport = _extract_viewport_from_figure(figure)
+    uirevision = None
+    if isinstance(figure, dict):
+        layout = figure.get("layout")
+        if isinstance(layout, dict):
+            uirevision = layout.get("uirevision")
+    record = _build_log_record(
         session_id,
         event="param_change",
         param_name=param_name,
-        old_value=old_value,
-        new_value=new_value,
+        old_value=norm_old,
+        new_value=norm_new,
         source=source,
+        params=norm_params,
+        t_client_ms=_int_or_none(commit_data.get("t_client")),
+        viewport=viewport,
         uirevision=uirevision,
-        viewport=None,
+        extras=None,
+        consent_granted=True,
     )
-    _log_with_throttle(session_id, record)
-    cache[param_name] = new_value
-    summary = _format_preview_message(record)
-    return _append_preview_log(log_store_data, summary)
+    result = _process_log_record(session_id, record, log_store_data, diag_store_data)
+    return result["preview"], result["diag"]
 
 
 @app.callback(
-    Output("store-log-sink", "data", allow_duplicate=True),
+    [
+        Output("store-log-sink", "data", allow_duplicate=True),
+        Output("store-log-diagnostics", "data", allow_duplicate=True),
+    ],
     [
         Input("toggle-vertex", "value"),
         Input("toggle-zeros", "value"),
@@ -3208,16 +3440,18 @@ def _log_slider_activity(source_store, a_value, b_value, c_value, session_data, 
         State("store-consent", "data"),
         State("store-ui", "data"),
         State("store-log-sink", "data"),
+        State("store-log-diagnostics", "data"),
+        State("graph-main", "figure"),
     ],
     prevent_initial_call=True,
 )
-def _log_overlay_toggle(vertex_value, zeros_value, trace_value, session_data, consent_data, ui_store_data, log_store_data):
+def _log_overlay_toggle(vertex_value, zeros_value, trace_value, session_data, consent_data, ui_store_data, log_store_data, diag_store_data, figure):
     if not _is_logging_allowed(consent_data):
-        return dash.no_update
+        return dash.no_update, dash.no_update
     session_id = _get_session_id(session_data)
     ctx = dash.callback_context
     if not ctx.triggered:
-        return dash.no_update
+        return dash.no_update, dash.no_update
     trigger_id = ctx.triggered[0]["prop_id"].split(".")[0]
     overlay_key = None
     new_enabled = None
@@ -3231,38 +3465,43 @@ def _log_overlay_toggle(vertex_value, zeros_value, trace_value, session_data, co
         overlay_key = "trace"
         new_enabled = _is_toggle_enabled(trace_value)
     else:
-        return dash.no_update
+        return dash.no_update, dash.no_update
 
     overlay_state = _get_overlay_state(session_id)
     old_value = overlay_state.get(overlay_key)
     if old_value == new_enabled:
-        return dash.no_update
+        return dash.no_update, dash.no_update
 
     overlay_state[overlay_key] = new_enabled
-    uirevision = _resolve_uirevision_value(ui_store_data)
-    record = _base_log_record(
+    uirevision = _figure_uirevision(figure, ui_store_data)
+    viewport = _extract_viewport_from_figure(figure)
+    params = _get_param_cache(session_id)
+    record = _build_log_record(
         session_id,
         event="overlay_toggle",
         param_name=None,
         old_value=old_value,
         new_value=new_enabled,
         source="toggle",
+        params=params,
+        t_client_ms=None,
+        viewport=viewport,
         uirevision=uirevision,
-        viewport=None,
         extras={
             "overlay": overlay_key,
             "enabled": bool(new_enabled),
         },
+        consent_granted=True,
     )
-    _write_log_record(session_id, record)
-    summary = _format_preview_message(record)
-    return _append_preview_log(log_store_data, summary)
+    result = _process_log_record(session_id, record, log_store_data, diag_store_data)
+    return result["preview"], result["diag"]
 
 
 @app.callback(
     [
         Output("download-jsonl", "data"),
         Output("store-log-sink", "data", allow_duplicate=True),
+        Output("store-log-diagnostics", "data", allow_duplicate=True),
     ],
     Input("btn-download-jsonl", "n_clicks"),
     [
@@ -3270,34 +3509,43 @@ def _log_overlay_toggle(vertex_value, zeros_value, trace_value, session_data, co
         State("store-consent", "data"),
         State("store-ui", "data"),
         State("store-log-sink", "data"),
+        State("store-log-diagnostics", "data"),
+        State("graph-main", "figure"),
     ],
     prevent_initial_call=True,
 )
-def _handle_download_jsonl(n_clicks, session_data, consent_data, ui_store_data, log_store_data):
+def _handle_download_jsonl(n_clicks, session_data, consent_data, ui_store_data, log_store_data, diag_store_data, figure):
     if not n_clicks or not _is_logging_allowed(consent_data):
-        return dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update
     session_id = _get_session_id(session_data)
     path = _get_session_log_path(session_id)
     if not path.exists():
-        return dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update
 
-    record = _base_log_record(
+    viewport = _extract_viewport_from_figure(figure)
+    record = _build_log_record(
         session_id,
         event="export",
-        source="button",
-        uirevision=_resolve_uirevision_value(ui_store_data),
-        viewport=None,
+        param_name=None,
+        old_value=None,
+        new_value=None,
+        source="programmatic",
+        params=_get_param_cache(session_id),
+        t_client_ms=None,
+        viewport=viewport,
+        uirevision=_figure_uirevision(figure, ui_store_data),
         extras={"export_type": "jsonl"},
+        consent_granted=True,
     )
-    _write_log_record(session_id, record)
-    summary = _format_preview_message(record)
-    return dcc.send_file(str(path)), _append_preview_log(log_store_data, summary)
+    result = _process_log_record(session_id, record, log_store_data, diag_store_data)
+    return dcc.send_file(str(path)), result["preview"], result["diag"]
 
 
 @app.callback(
     [
         Output("download-csv", "data"),
         Output("store-log-sink", "data", allow_duplicate=True),
+        Output("store-log-diagnostics", "data", allow_duplicate=True),
     ],
     Input("btn-download-csv", "n_clicks"),
     [
@@ -3305,30 +3553,38 @@ def _handle_download_jsonl(n_clicks, session_data, consent_data, ui_store_data, 
         State("store-consent", "data"),
         State("store-ui", "data"),
         State("store-log-sink", "data"),
+        State("store-log-diagnostics", "data"),
+        State("graph-main", "figure"),
     ],
     prevent_initial_call=True,
 )
-def _handle_download_csv(n_clicks, session_data, consent_data, ui_store_data, log_store_data):
+def _handle_download_csv(n_clicks, session_data, consent_data, ui_store_data, log_store_data, diag_store_data, figure):
     if not n_clicks or not _is_logging_allowed(consent_data):
-        return dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update
     session_id = _get_session_id(session_data)
     records = _read_session_log_records(session_id)
     csv_content = _build_csv_content(records)
     if not csv_content:
-        return dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update
 
-    record = _base_log_record(
+    viewport = _extract_viewport_from_figure(figure)
+    record = _build_log_record(
         session_id,
         event="export",
-        source="button",
-        uirevision=_resolve_uirevision_value(ui_store_data),
-        viewport=None,
+        param_name=None,
+        old_value=None,
+        new_value=None,
+        source="programmatic",
+        params=_get_param_cache(session_id),
+        t_client_ms=None,
+        viewport=viewport,
+        uirevision=_figure_uirevision(figure, ui_store_data),
         extras={"export_type": "csv"},
+        consent_granted=True,
     )
-    _write_log_record(session_id, record)
-    summary = _format_preview_message(record)
+    result = _process_log_record(session_id, record, log_store_data, diag_store_data)
     filename = f"session_{_safe_session_id(session_id)}.csv"
-    return dcc.send_string(csv_content, filename=filename), _append_preview_log(log_store_data, summary)
+    return dcc.send_string(csv_content, filename=filename), result["preview"], result["diag"]
 
 
 @app.callback(
@@ -3341,17 +3597,21 @@ def _handle_download_csv(n_clicks, session_data, consent_data, ui_store_data, lo
         Output("input-c", "value", allow_duplicate=True),
         Output("store-ui", "data"),
         Output("store-log-sink", "data", allow_duplicate=True),
+        Output("store-log-diagnostics", "data", allow_duplicate=True),
     ],
     Input("btn-reset", "n_clicks"),
     State("store-ui", "data"),
     State("store-session", "data"),
     State("store-consent", "data"),
     State("store-log-sink", "data"),
+    State("store-log-diagnostics", "data"),
+    State("graph-main", "figure"),
     prevent_initial_call=True,
 )
-def _handle_reset(n_clicks, ui_store_data, session_data, consent_data, log_store_data):
+def _handle_reset(n_clicks, ui_store_data, session_data, consent_data, log_store_data, diag_store_data, figure):
     if not n_clicks:
         return (
+            dash.no_update,
             dash.no_update,
             dash.no_update,
             dash.no_update,
@@ -3364,18 +3624,29 @@ def _handle_reset(n_clicks, ui_store_data, session_data, consent_data, log_store
 
     updated_ui_store = _bump_uirevision_store(ui_store_data)
     session_id = _get_session_id(session_data)
-    _SESSION_PARAM_CACHE[session_id] = dict(_DEFAULT_PARAMS)
+    norm_defaults = _normalize_params(_DEFAULT_PARAMS)
+    _SESSION_PARAM_CACHE[session_id] = dict(norm_defaults)
     log_update = dash.no_update
+    diag_update = dash.no_update
     if _is_logging_allowed(consent_data):
-        record = _base_log_record(
+        viewport = _extract_viewport_from_figure(figure)
+        record = _build_log_record(
             session_id,
             event="reset",
-            source="button",
-            uirevision=_resolve_uirevision_value(updated_ui_store),
-            viewport=None,
-        )
-        _write_log_record(session_id, record)
-        log_update = _append_preview_log(log_store_data, _format_preview_message(record))
+            param_name=None,
+            old_value=None,
+            new_value=None,
+            source="reset",
+        params=norm_defaults,
+        t_client_ms=None,
+        viewport=viewport,
+        uirevision=_figure_uirevision(figure, updated_ui_store),
+        extras=None,
+        consent_granted=True,
+    )
+        result = _process_log_record(session_id, record, log_store_data, diag_store_data)
+        log_update = result["preview"]
+        diag_update = result["diag"]
     return (
         _DEFAULT_PARAMS["a"],
         _DEFAULT_PARAMS["b"],
@@ -3385,6 +3656,7 @@ def _handle_reset(n_clicks, ui_store_data, session_data, consent_data, log_store
         _DEFAULT_PARAMS["c"],
         updated_ui_store,
         log_update,
+        diag_update,
     )
 
 
@@ -3404,6 +3676,49 @@ def _render_log_display(log_entries, consent_data):
         return "Recent logs will appear here."
     lines = [f"- {entry}" for entry in reversed(log_entries)]
     return "\n".join(["Recent logs:", *lines])
+
+
+@app.callback(
+    Output("diagnostics-panel", "children"),
+    Input("store-log-diagnostics", "data"),
+    [
+        State("slider-a", "value"),
+        State("slider-b", "value"),
+        State("slider-c", "value"),
+    ],
+)
+def _render_diagnostics(diag_data, a_value, b_value, c_value):
+    if not isinstance(diag_data, list) or not diag_data:
+        return "No logs yet."
+    lines = []
+    for entry in diag_data[-10:]:
+        seq = entry.get("seq", "?")
+        event = entry.get("event", "?")
+        src = entry.get("source", "?")
+        param = entry.get("param_name")
+        old_v = _format_value_preview(entry.get("old_value"))
+        new_v = _format_value_preview(entry.get("new_value"))
+        delta = ""
+        if param:
+            delta = f"{param} {old_v} \u2192 {new_v}"
+        params_tuple = f"a={_format_value_preview(entry.get('a'))}, b={_format_value_preview(entry.get('b'))}, c={_format_value_preview(entry.get('c'))}"
+        elapsed = entry.get("elapsed_time_ms")
+        elapsed_txt = f"{elapsed}ms" if isinstance(elapsed, (int, float)) else "?"
+        lines.append(
+            f"#{seq} {event} {delta} [{src}] {params_tuple} Δt={elapsed_txt} tc={entry.get('t_client_ms')} ts={entry.get('t_server_iso')}"
+        )
+    latest = diag_data[-1]
+    drift = False
+    try:
+        drift = any(
+            abs(_normalize_param_value(k, v) - float(latest.get(k))) > 1e-9
+            for k, v in [("a", a_value), ("b", b_value), ("c", c_value)]
+        )
+    except Exception:
+        drift = False
+    if drift:
+        lines.append("⚠ UI values diverge from last logged a/b/c.")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
